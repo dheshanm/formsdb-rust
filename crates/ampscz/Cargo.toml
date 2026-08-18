@@ -1,0 +1,63 @@
+[package]
+name = "ampscz"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "get_cohort"
+path = "src/get_cohort.rs"
+
+[[bin]]
+name = "import_rpms_csvs"
+path = "src/import_rpms_csvs.rs"
+
+[[bin]]
+name = "import_rpms_entry_status"
+path = "src/import_rpms_entry_status.rs"
+
+[[bin]]
+name = "import_rpms_client_status"
+path = "src/import_rpms_client_status.rs"
+
+[[bin]]
+name = "import_data_dictionary"
+path = "src/import_data_dictionary.rs"
+
+[[bin]]
+name = "import_redcap_jsons"
+path = "src/import_redcap_jsons.rs"
+
+[[bin]]
+name = "import_form_qc"
+path = "src/import_form_qc.rs"
+
+[[bin]]
+name = "import_calculated_outcomes"
+path = "src/import_calculated_outcomes.rs"
+
+[[bin]]
+name = "export_combined_csv"
+path = "src/export_combined_csv.rs"
+
+[dependencies]
+calamine = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+csv = { workspace = true }
+db = { workspace = true }
+futures-util = { workspace = true }
+hashify = { workspace = true }
+indicatif = { workspace = true }
+polars = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-indicatif = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[features]
+db_tests = ["db/db_tests"]

@@ -1,0 +1,16 @@
+[package]
+name = "db"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+sqlx = { workspace = true }
+tracing = { workspace = true }
+polars = { workspace = true, features = ["json"] }
+futures-util = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[features]
+db_tests = []
