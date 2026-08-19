@@ -13,8 +13,8 @@ use futures_util::{StreamExt, TryStreamExt, stream};
 use indicatif::ProgressStyle;
 use polars::prelude::DataFrame;
 use serde_json::{Map, Number, Value};
-use sqlx::{PgPool, Postgres, Row, Transaction};
-use tracing::{info, warn};
+use sqlx::{PgPool, Row};
+use tracing::info;
 use tracing_indicatif::{IndicatifLayer, span_ext::IndicatifSpanExt};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -34,7 +34,7 @@ struct Cli {
     #[arg(long, default_value = "Prescient")]
     network: String,
 
-    /// Number of subjects parsed and written concurrently.
+    /// Number of subjects parsed concurrently.
     #[arg(short, long, default_value_t = 8)]
     jobs: usize,
 
@@ -353,26 +353,44 @@ fn process_subject(
     })
 }
 
-async fn write_subject(pool: &PgPool, subject: SubjectImport) -> Result<usize, sqlx::Error> {
-    let mut tx: Transaction<'_, Postgres> = pool.begin().await?;
-    sqlx::query("DELETE FROM forms.forms WHERE subject_id = $1")
-        .bind(&subject.subject_id)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("INSERT INTO subjects (id, site_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
-        .bind(&subject.subject_id)
-        .bind(&subject.subject_id[..2.min(subject.subject_id.len())])
-        .execute(&mut *tx)
-        .await?;
+fn sql_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn subject_queries(subject: SubjectImport) -> ImportResult<Vec<String>> {
+    let mut queries = Vec::with_capacity(subject.forms.len() + 2);
+    let subject_id = sql_literal(&subject.subject_id);
+    let site_id = sql_literal(&subject.subject_id[..2.min(subject.subject_id.len())]);
+    queries.push(format!(
+        "DELETE FROM forms.forms WHERE subject_id = {subject_id};"
+    ));
+    queries.push(format!(
+        "INSERT INTO subjects (id, site_id) VALUES ({subject_id}, {site_id}) ON CONFLICT DO NOTHING;"
+    ));
+
     let count = subject.forms.len();
     for form in subject.forms {
-        sqlx::query("INSERT INTO forms.forms (subject_id, form_name, event_name, form_data, source_mdate, variables_with_data, variables_without_data, total_variables, percent_complete) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)")
-			.bind(&subject.subject_id).bind(form.form_name).bind(form.event_name).bind(form.form_data)
-			.bind(subject.source_mdate).bind(form.variables_with_data).bind(form.variables_without_data)
-			.bind(form.total_variables).bind(form.percent_complete).execute(&mut *tx).await?;
+        let form_data = serde_json::to_string(&form.form_data)?;
+        let variables_without_data = form
+            .variables_without_data
+            .map_or_else(|| "NULL".to_owned(), |value| value.to_string());
+        let total_variables = form
+            .total_variables
+            .map_or_else(|| "NULL".to_owned(), |value| value.to_string());
+        let percent_complete = form
+            .percent_complete
+            .map_or_else(|| "NULL".to_owned(), |value| value.to_string());
+        queries.push(format!(
+            "INSERT INTO forms.forms (subject_id, form_name, event_name, form_data, source_mdate, variables_with_data, variables_without_data, total_variables, percent_complete) VALUES ({subject_id}, {}, {}, {}::jsonb, {}, {}, {variables_without_data}, {total_variables}, {percent_complete});",
+            sql_literal(&form.form_name),
+            sql_literal(&form.event_name),
+            sql_literal(&form_data),
+            sql_literal(&subject.source_mdate.format("%Y-%m-%d %H:%M:%S%.6f").to_string()),
+            form.variables_with_data,
+        ));
     }
-    tx.commit().await?;
-    Ok(count)
+    debug_assert_eq!(queries.len(), count + 2);
+    Ok(queries)
 }
 
 #[tokio::main]
@@ -438,7 +456,7 @@ async fn main() -> ImportResult<()> {
     let _enter = span.enter();
     span.pb_set_style(&style);
     span.pb_set_length(paths.len() as u64);
-    let (subjects, form_rows) = stream::iter(paths)
+    let subjects = stream::iter(paths)
         .map(|path| {
             let dictionary = std::sync::Arc::clone(&dictionary);
             async move {
@@ -448,39 +466,23 @@ async fn main() -> ImportResult<()> {
             }
         })
         .buffer_unordered(jobs)
-        // Database work is asynchronous and I/O-bound, so it belongs on
-        // Tokio rather than Rayon. `buffer_unordered` bounds simultaneous
-        // transactions to `jobs` (and the pool independently caps them at
-        // `max_connections`) while allowing completed parses to be written
-        // without waiting for every subject to finish parsing.
-        .map(|subject| {
-            let pool = pool.clone();
-            let span = span.clone();
-            async move {
-                let subject = subject?;
-                span.pb_set_message(&format!("Writing subject {}", subject.subject_id));
-                let count = match write_subject(&pool, subject).await {
-                    Ok(count) => count,
-                    Err(error) => {
-                        warn!(%error, "failed to write subject");
-                        0
-                    }
-                };
-                span.pb_inc(1);
-                Ok::<_, Box<dyn Error + Send + Sync>>(count)
-            }
-        })
-        .buffer_unordered(jobs)
-        .try_fold(
-            (0usize, 0usize),
-            |(subjects, form_rows), count| async move {
-                Ok::<_, Box<dyn Error + Send + Sync>>((subjects + 1, form_rows + count))
-            },
-        )
+        .try_collect::<Vec<_>>()
         .await?;
+    let subject_count = subjects.len();
+    let form_rows = subjects.iter().map(|subject| subject.forms.len()).sum::<usize>();
+    let queries = subjects
+        .into_iter()
+        .map(subject_queries)
+        .collect::<ImportResult<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    span.pb_set_message(&format!("Executing {} SQL queries", queries.len()));
+    db::execute_queries_in_transaction(&pool, &queries).await?;
+    span.pb_set_position(subject_count as u64);
     drop(_enter);
     drop(span);
-    info!(subjects, form_rows, "Imported REDCap JSON forms");
+    info!(subjects = subject_count, form_rows, queries = queries.len(), "Imported REDCap JSON forms");
     pool.close().await;
     Ok(())
 }
@@ -515,6 +517,34 @@ mod tests {
         assert_eq!(columns["redcap_event_name"].len(), 2);
         assert_eq!(columns["bprs"][0], serde_json::json!("2"));
         assert_eq!(columns["bprs"][1], Value::Null);
+    }
+
+    #[test]
+    fn generates_queries_for_a_subject_as_one_ordered_sequence() {
+        let queries = subject_queries(SubjectImport {
+            subject_id: "GA76723".to_owned(),
+            source_mdate: NaiveDate::from_ymd_opt(2026, 8, 19)
+                .unwrap()
+                .and_hms_micro_opt(12, 0, 0, 123_456)
+                .unwrap(),
+            forms: vec![FormInsert {
+                form_name: "example's form".to_owned(),
+                event_name: "baseline_arm_1".to_owned(),
+                form_data: serde_json::json!({"text": "O'Brien"}),
+                variables_with_data: 1,
+                variables_without_data: Some(2),
+                total_variables: Some(3),
+                percent_complete: Some(33.333_333),
+            }],
+        })
+        .unwrap();
+
+        assert_eq!(queries.len(), 3);
+        assert!(queries[0].starts_with("DELETE FROM forms.forms"));
+        assert!(queries[1].starts_with("INSERT INTO subjects"));
+        assert!(queries[2].contains("example''s form"));
+        assert!(queries[2].contains("O''Brien"));
+        assert!(queries[2].contains("2026-08-19 12:00:00.123456"));
     }
 
     #[test]
