@@ -13,7 +13,7 @@ use futures_util::{StreamExt, TryStreamExt, stream};
 use indicatif::ProgressStyle;
 use polars::prelude::DataFrame;
 use serde_json::{Map, Number, Value};
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use tracing::{info, warn};
 use tracing_indicatif::{IndicatifLayer, span_ext::IndicatifSpanExt};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -41,6 +41,10 @@ struct Cli {
     /// Maximum PostgreSQL connections used by this import.
     #[arg(long)]
     max_connections: Option<u32>,
+
+    /// Reimport every discovered JSON file, ignoring stored source timestamps.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Debug)]
@@ -57,8 +61,82 @@ struct FormInsert {
 #[derive(Debug)]
 struct SubjectImport {
     subject_id: String,
-    source_mdate: DateTime<Utc>,
+    source_mdate: NaiveDateTime,
     forms: Vec<FormInsert>,
+}
+
+fn subject_id_from_path(path: &Path) -> ImportResult<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.split('.').next())
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("invalid subject JSON filename: {}", path.display()).into())
+}
+
+/// Return the source modification time at PostgreSQL's microsecond precision.
+///
+/// PostgreSQL `timestamp` values retain microseconds, whereas filesystem mtimes
+/// may retain nanoseconds. Normalizing before comparison prevents an unchanged
+/// file from being continually reimported due only to precision loss.
+fn source_mdate(path: &Path) -> ImportResult<NaiveDateTime> {
+    let modified = DateTime::<Utc>::from(
+        fs::metadata(path)?
+            .modified()
+            .unwrap_or(SystemTime::UNIX_EPOCH),
+    );
+    DateTime::from_timestamp_micros(modified.timestamp_micros())
+        .map(|timestamp| timestamp.naive_utc())
+        .ok_or_else(|| format!("invalid source modification time: {}", path.display()).into())
+}
+
+fn is_up_to_date(
+    path: &Path,
+    imported_mdates: &BTreeMap<String, NaiveDateTime>,
+) -> ImportResult<bool> {
+    let subject_id = subject_id_from_path(path)?;
+    Ok(imported_mdates.get(&subject_id) == Some(&source_mdate(path)?))
+}
+
+/// Get the latest recorded source timestamp for each previously imported subject.
+async fn imported_source_mdates(
+    pool: &PgPool,
+) -> Result<BTreeMap<String, NaiveDateTime>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT subject_id, MAX(source_mdate) AS source_mdate FROM forms.forms GROUP BY subject_id",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let subject_id: String = row.try_get("subject_id").ok()?;
+            let source_mdate: Option<NaiveDateTime> = row.try_get("source_mdate").ok()?;
+            let source_mdate = source_mdate?;
+            Some((subject_id, source_mdate))
+        })
+        .collect())
+}
+
+fn paths_to_import(
+    paths: Vec<PathBuf>,
+    imported_mdates: &BTreeMap<String, NaiveDateTime>,
+    force: bool,
+) -> ImportResult<Vec<PathBuf>> {
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            if force {
+                return Some(Ok(path));
+            }
+            match is_up_to_date(&path, imported_mdates) {
+                Ok(true) => None,
+                Ok(false) => Some(Ok(path)),
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect()
 }
 
 fn subject_json_paths(
@@ -191,18 +269,8 @@ fn process_subject(
     path: PathBuf,
     dictionary: &BTreeMap<String, String>,
 ) -> ImportResult<SubjectImport> {
-    let subject_id = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| name.split('.').next())
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| format!("invalid subject JSON filename: {}", path.display()))?
-        .to_owned();
-    let source_mdate = DateTime::<Utc>::from(
-        fs::metadata(&path)?
-            .modified()
-            .unwrap_or(SystemTime::UNIX_EPOCH),
-    );
+    let subject_id = subject_id_from_path(&path)?;
+    let source_mdate = source_mdate(&path)?;
     let columns = json_columns(&path)?;
     let events = columns
         .get("redcap_event_name")
@@ -348,6 +416,23 @@ async fn main() -> ImportResult<()> {
     }
     let dictionary = std::sync::Arc::new(dictionary);
 
+    let imported_mdates = if cli.force {
+        BTreeMap::new()
+    } else {
+        imported_source_mdates(&pool).await?
+    };
+    let total_discovered = paths.len();
+    let paths = paths_to_import(paths, &imported_mdates, cli.force)?;
+    let skipped = total_discovered - paths.len();
+    if skipped > 0 {
+        info!(skipped, "Skipping unchanged REDCap JSON subjects");
+    }
+    if paths.is_empty() {
+        info!("All discovered REDCap JSON subjects are up to date");
+        pool.close().await;
+        return Ok(());
+    }
+
     let style = ProgressStyle::default_bar().template("{span_child_prefix}{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) {msg}").expect("valid template").progress_chars("#>-");
     let span = tracing::info_span!("importing_redcap_jsons");
     let _enter = span.enter();
@@ -430,5 +515,30 @@ mod tests {
         assert_eq!(columns["redcap_event_name"].len(), 2);
         assert_eq!(columns["bprs"][0], serde_json::json!("2"));
         assert_eq!(columns["bprs"][1], Value::Null);
+    }
+
+    #[test]
+    fn filters_only_subjects_with_changed_source_timestamps() {
+        let directory = std::env::temp_dir().join(format!(
+            "import_redcap_jsons_test_{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let unchanged = directory.join("AA00001.Prescient.json");
+        let changed = directory.join("AA00002.Prescient.json");
+        fs::write(&unchanged, "{}").unwrap();
+        fs::write(&changed, "{}").unwrap();
+        let mut imported_mdates = BTreeMap::new();
+        imported_mdates.insert("AA00001".to_owned(), source_mdate(&unchanged).unwrap());
+
+        let paths = paths_to_import(
+            vec![unchanged.clone(), changed.clone()],
+            &imported_mdates,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(paths, vec![changed]);
+        fs::remove_dir_all(directory).unwrap();
     }
 }
