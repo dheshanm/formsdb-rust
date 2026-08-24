@@ -1,0 +1,33 @@
+[package]
+name = "mindlamp_gps"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "gps_init_db"
+path = "src/init_db.rs"
+
+[[bin]]
+name = "gps_ingest_jsons"
+path = "src/ingest_jsons.rs"
+
+[dependencies]
+db = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+polars = { workspace = true, features = ["json"] }
+futures-util = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+glob = "0.3"
+indicatif = { workspace = true }
+tracing-indicatif = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[features]
+db_tests = ["db/db_tests"]
