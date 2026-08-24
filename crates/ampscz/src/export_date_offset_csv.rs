@@ -29,11 +29,12 @@ struct Cli {
 
 	/// One or more date offset sources.
 	///
-	/// Supported values:
-	/// - /path/to/date_offset.csv
-	/// - /path/to/directory (recursively finds *date_offset*.csv)
-	/// - NETWORK=/path/to/date_offset.csv
-	/// - NETWORK=/path/to/directory
+	/// Pass one or more paths after `--date-offset`.
+	/// Each path can be a file or a directory. Directories are searched
+	/// recursively for `*date_offset*.csv`.
+	///
+	/// Network-specific files are detected from the source path when a path
+	/// segment includes names like `Pronet` or `Prescient`.
 	#[arg(long = "date-offset", required = true, num_args = 1..)]
 	date_offset: Vec<String>,
 
@@ -65,6 +66,29 @@ fn normalize_network(name: &str) -> String {
 	name.trim().to_ascii_uppercase()
 }
 
+fn network_from_text(value: &str) -> Option<String> {
+	let value = normalize_network(value);
+	if value.contains("PRONET") {
+		return Some("PRONET".to_owned());
+	}
+	if value.contains("PRESCIENT") {
+		return Some("PRESCIENT".to_owned());
+	}
+	None
+}
+
+fn infer_network_from_path(path: &Path) -> Option<String> {
+	for segment in path.iter() {
+		let Some(segment) = segment.to_str() else {
+			continue;
+		};
+		if let Some(network) = network_from_text(segment) {
+			return Some(network);
+		}
+	}
+	None
+}
+
 fn parse_offset_source_spec(raw: &str) -> OffsetSourceSpec {
 	if let Some((network, path)) = raw.split_once('=') {
 		return OffsetSourceSpec {
@@ -73,9 +97,11 @@ fn parse_offset_source_spec(raw: &str) -> OffsetSourceSpec {
 		};
 	}
 
+	let path = PathBuf::from(raw);
+
 	OffsetSourceSpec {
-		network: None,
-		path: PathBuf::from(raw),
+		network: infer_network_from_path(&path),
+		path,
 	}
 }
 
@@ -265,6 +291,9 @@ fn list_combined_csvs(input_dir: &Path) -> ExportResult<Vec<PathBuf>> {
 fn network_from_combined_name(path: &Path) -> Option<String> {
 	let file_name = path.file_name()?.to_str()?;
 	let stem = file_name.strip_suffix(".csv").unwrap_or(file_name);
+	let stem = stem
+		.strip_suffix("_dateShifted-day1to1")
+		.unwrap_or(stem);
 	let stem = stem.strip_suffix("-dateShifted").unwrap_or(stem);
 	let stem = stem.strip_suffix("-day1to1").unwrap_or(stem);
 	let (_, network) = stem.rsplit_once('_')?;
@@ -278,6 +307,15 @@ fn shifted_output_name(input_file: &Path) -> ExportResult<String> {
 		.ok_or_else(|| format!("Invalid UTF-8 file name: {}", input_file.display()))?;
 
 	if let Some(stem) = file_name.strip_suffix(".csv") {
+		if stem.ends_with("_dateShifted-day1to1") {
+			return Ok(file_name.to_owned());
+		}
+		if let Some(prefix) = stem.strip_suffix("-day1to1") {
+			if prefix.ends_with("_dateShifted") {
+				return Ok(file_name.to_owned());
+			}
+			return Ok(format!("{prefix}_dateShifted-day1to1.csv"));
+		}
 		if stem.ends_with("-dateShifted") {
 			return Ok(file_name.to_owned());
 		}
@@ -517,7 +555,13 @@ mod tests {
 	use std::{fs::File, io::Write};
 
 	#[test]
-	fn parses_network_and_path_offset_spec() {
+	fn infers_network_from_offset_path() {
+		let spec = parse_offset_source_spec("/data/predict1/data_from_nda/Pronet/PHOENIX/PROTECTED/date_offset.csv");
+		assert_eq!(spec.network.as_deref(), Some("PRONET"));
+	}
+
+	#[test]
+	fn parses_legacy_network_and_path_offset_spec() {
 		let spec = parse_offset_source_spec("PRESCIENT=/tmp/date_offset.csv");
 		assert_eq!(spec.network.as_deref(), Some("PRESCIENT"));
 		assert_eq!(spec.path, PathBuf::from("/tmp/date_offset.csv"));
@@ -541,7 +585,7 @@ mod tests {
 		let input = PathBuf::from("AMPSCZ-combined-redcap_baseline_ProNET-day1to1.csv");
 		assert_eq!(
 			shifted_output_name(&input).expect("valid output name"),
-			"AMPSCZ-combined-redcap_baseline_ProNET-day1to1-dateShifted.csv"
+			"AMPSCZ-combined-redcap_baseline_ProNET_dateShifted-day1to1.csv"
 		);
 	}
 
