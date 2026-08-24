@@ -19,7 +19,7 @@ const CLIENT_STATUS_RAW_SUFFIX: &str = "_ClientStatusRawData.csv";
 type ImportResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 type CsvRow = BTreeMap<String, String>;
 
-/// Import RPMS ClientStatus and ClientStatusRawData CAV CSVs.
+/// Import RPMS ClientStatus and ClientStatusRawData CSVs.
 /// Required environment variable: DB_URI.
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -33,7 +33,7 @@ struct Cli {
     max_connections: u32,
 }
 
-fn cav_survey_paths(data_root: &Path, suffix: &str) -> ImportResult<Vec<PathBuf>> {
+fn get_survey_paths(data_root: &Path, suffix: &str) -> ImportResult<Vec<PathBuf>> {
     let mut paths = Vec::new();
 
     // `data_root` is the PHOENIX directory, matching the other Rust importers.
@@ -159,6 +159,14 @@ fn parse_status_date(value: &str) -> Option<NaiveDate> {
     })
 }
 
+fn non_empty_csv_value(value: &str) -> Option<&str> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
 fn rows_to_dataframe(rows: &[CsvRow], parse_dates: bool) -> ImportResult<DataFrame> {
     let names = rows
         .iter()
@@ -180,7 +188,7 @@ fn rows_to_dataframe(rows: &[CsvRow], parse_dates: bool) -> ImportResult<DataFra
             } else {
                 let values = rows
                     .iter()
-                    .map(|row| row.get(&name).map(String::as_str))
+                    .map(|row| row.get(&name).and_then(|value| non_empty_csv_value(value)))
                     .collect::<Vec<_>>();
                 Column::new(name.into(), values)
             }
@@ -239,35 +247,35 @@ async fn main() -> ImportResult<()> {
     discovery_span.pb_set_style(
         &ProgressStyle::with_template("{spinner:.green} {msg}").expect("valid template"),
     );
-    discovery_span.pb_set_message("Looking for ClientStatus CAV CSVs");
+    discovery_span.pb_set_message("Looking for ClientStatus CSVs");
     let _discovery_enter = discovery_span.enter();
-    let client_status_paths = cav_survey_paths(&cli.data_root, CLIENT_STATUS_SUFFIX);
+    let client_status_paths = get_survey_paths(&cli.data_root, CLIENT_STATUS_SUFFIX);
     drop(_discovery_enter);
     drop(discovery_span);
     let client_status_paths = client_status_paths?;
     info!(
         count = client_status_paths.len(),
-        "Found ClientStatus CAV CSVs"
+        "Found ClientStatus CSVs"
     );
 
     let discovery_span = tracing::info_span!("looking_for_client_status_raw_csvs");
     discovery_span.pb_set_style(
         &ProgressStyle::with_template("{spinner:.green} {msg}").expect("valid template"),
     );
-    discovery_span.pb_set_message("Looking for ClientStatusRawData CAV CSVs");
+    discovery_span.pb_set_message("Looking for ClientStatusRawData CSVs");
     let _discovery_enter = discovery_span.enter();
-    let client_status_raw_paths = cav_survey_paths(&cli.data_root, CLIENT_STATUS_RAW_SUFFIX);
+    let client_status_raw_paths = get_survey_paths(&cli.data_root, CLIENT_STATUS_RAW_SUFFIX);
     drop(_discovery_enter);
     drop(discovery_span);
     let client_status_raw_paths = client_status_raw_paths?;
     info!(
         count = client_status_raw_paths.len(),
-        "Found ClientStatusRawData CAV CSVs"
+        "Found ClientStatusRawData CSVs"
     );
 
     if client_status_paths.is_empty() && client_status_raw_paths.is_empty() {
         return Err(format!(
-            "no ClientStatus CAV CSV files found under {}",
+            "no ClientStatus CSV files found under {}",
             cli.data_root.display()
         )
         .into());
@@ -365,7 +373,24 @@ mod tests {
     }
 
     #[test]
-    fn finds_both_cav_file_types() {
+    fn maps_blank_cells_to_null_in_dataframe() {
+        let rows = vec![
+            row(&[("subject_id", "AB001"), ("main_status", ""), ("sub_status", "   ")]),
+            row(&[
+                ("subject_id", "AB002"),
+                ("main_status", "Included"),
+                ("sub_status", "Scheduled"),
+            ]),
+        ];
+
+        let dataframe = rows_to_dataframe(&rows, false).unwrap();
+        assert_eq!(dataframe.column("main_status").unwrap().null_count(), 1);
+        assert_eq!(dataframe.column("sub_status").unwrap().null_count(), 1);
+        assert_eq!(dataframe.column("subject_id").unwrap().null_count(), 0);
+    }
+
+    #[test]
+    fn finds_both_csv_file_types() {
         let temp =
             std::env::temp_dir().join(format!("rpms-client-status-test-{}", std::process::id()));
         let surveys = temp.join("PROTECTED/Prescient/raw/AB001/surveys");
@@ -376,11 +401,11 @@ mod tests {
         fs::write(&raw, "subjectkey\nAB001\n").unwrap();
 
         assert_eq!(
-            cav_survey_paths(&temp, CLIENT_STATUS_SUFFIX).unwrap(),
+            get_survey_paths(&temp, CLIENT_STATUS_SUFFIX).unwrap(),
             vec![status]
         );
         assert_eq!(
-            cav_survey_paths(&temp, CLIENT_STATUS_RAW_SUFFIX).unwrap(),
+            get_survey_paths(&temp, CLIENT_STATUS_RAW_SUFFIX).unwrap(),
             vec![raw]
         );
         fs::remove_dir_all(temp).unwrap();
