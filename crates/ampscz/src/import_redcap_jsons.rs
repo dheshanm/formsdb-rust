@@ -20,6 +20,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 
 type ImportResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 type FormEvents = BTreeMap<String, BTreeMap<String, Map<String, Value>>>;
+const DEFAULT_LOG_FREQ: usize = 100;
 
 /// Import REDCap JSON survey exports into `forms.forms`.
 /// Required environment variable: DB_URI.
@@ -393,6 +394,27 @@ fn subject_queries(subject: SubjectImport) -> ImportResult<Vec<String>> {
     Ok(queries)
 }
 
+fn parse_log_frequency(raw: Option<&str>) -> ImportResult<usize> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_LOG_FREQ);
+    };
+    let frequency = raw
+        .parse::<usize>()
+        .map_err(|_| format!("LOG_FREQ must be a positive integer, got {raw:?}"))?;
+    if frequency == 0 {
+        return Err("LOG_FREQ must be greater than zero".into());
+    }
+    Ok(frequency)
+}
+
+fn log_frequency() -> ImportResult<usize> {
+    match std::env::var("LOG_FREQ") {
+        Ok(raw) => parse_log_frequency(Some(&raw)),
+        Err(std::env::VarError::NotPresent) => parse_log_frequency(None),
+        Err(error) => Err(format!("failed to read LOG_FREQ: {error}").into()),
+    }
+}
+
 #[tokio::main]
 async fn main() -> ImportResult<()> {
     let indicatif_layer = IndicatifLayer::new();
@@ -422,6 +444,8 @@ async fn main() -> ImportResult<()> {
     }
 
     let jobs = cli.jobs.max(1);
+    let log_freq = log_frequency()?;
+    info!(log_freq, "Logging REDCap JSON progress");
     let db_uri = std::env::var("DB_URI").map_err(|_| "DB_URI environment variable must be set")?;
     let pool =
         db::create_pool_with_options(&db_uri, cli.max_connections.unwrap_or(jobs as u32)).await?;
@@ -455,8 +479,9 @@ async fn main() -> ImportResult<()> {
     let span = tracing::info_span!("importing_redcap_jsons");
     let _enter = span.enter();
     span.pb_set_style(&style);
-    span.pb_set_length(paths.len() as u64);
-    let subjects = stream::iter(paths)
+    let total_to_import = paths.len();
+    span.pb_set_length(total_to_import as u64);
+    let mut subject_stream = stream::iter(paths)
         .map(|path| {
             let dictionary = std::sync::Arc::clone(&dictionary);
             async move {
@@ -465,9 +490,16 @@ async fn main() -> ImportResult<()> {
                     .map_err(|error| -> Box<dyn Error + Send + Sync> { Box::new(error) })?
             }
         })
-        .buffer_unordered(jobs)
-        .try_collect::<Vec<_>>()
-        .await?;
+        .buffer_unordered(jobs);
+    let mut subjects = Vec::with_capacity(total_to_import);
+    while let Some(subject) = subject_stream.try_next().await? {
+        subjects.push(subject);
+        span.pb_inc(1);
+        let processed = subjects.len();
+        if processed % log_freq == 0 || processed == total_to_import {
+            info!(processed, total = total_to_import, "Processed REDCap JSON subjects");
+        }
+    }
     let subject_count = subjects.len();
     let form_rows = subjects.iter().map(|subject| subject.forms.len()).sum::<usize>();
     let queries = subjects
@@ -570,5 +602,27 @@ mod tests {
 
         assert_eq!(paths, vec![changed]);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn log_frequency_uses_default_when_unset() {
+        assert_eq!(parse_log_frequency(None).unwrap(), DEFAULT_LOG_FREQ);
+    }
+
+    #[test]
+    fn log_frequency_reads_env_value() {
+        assert_eq!(parse_log_frequency(Some("25")).unwrap(), 25);
+    }
+
+    #[test]
+    fn log_frequency_rejects_zero() {
+        let error = parse_log_frequency(Some("0")).unwrap_err().to_string();
+        assert!(error.contains("greater than zero"));
+    }
+
+    #[test]
+    fn log_frequency_rejects_non_numeric_values() {
+        let error = parse_log_frequency(Some("abc")).unwrap_err().to_string();
+        assert!(error.contains("positive integer"));
     }
 }
