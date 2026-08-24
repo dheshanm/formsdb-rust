@@ -39,6 +39,10 @@ path = "src/import_calculated_outcomes.rs"
 name = "export_combined_csv"
 path = "src/export_combined_csv.rs"
 
+[[bin]]
+name = "export_date_offset_csv"
+path = "src/export_date_offset_csv.rs"
+
 [dependencies]
 calamine = { workspace = true }
 chrono = { workspace = true }
