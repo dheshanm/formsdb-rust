@@ -474,6 +474,7 @@ async fn main() -> ImportResult<()> {
         pool.close().await;
         return Ok(());
     }
+    info!(paths = paths.len(), "Starting import of REDCap JSON subjects");
 
     let style = ProgressStyle::default_bar().template("{span_child_prefix}{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) {msg}").expect("valid template").progress_chars("#>-");
     let span = tracing::info_span!("importing_redcap_jsons");
