@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     error::Error,
     fs,
+    io,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -10,12 +11,15 @@ use std::{
     time::SystemTime,
 };
 
-use ampscz::constants::{form_name_to_rpms_suffix, rpms_to_redcap_event, FORM_NAME_RPMS_SUFFIXES};
+use ampscz::{
+    EntryStatusItem, get_subject_cohort, get_subject_form_completion_variables,
+    constants::{form_name_to_rpms_suffix, rpms_to_redcap_event, FORM_NAME_RPMS_SUFFIXES},
+};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use clap::Parser;
 use futures_util::{stream, StreamExt, TryStreamExt};
 use serde_json::{Map, Number, Value};
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use tracing::{info, warn};
 
 const IGNORED_METADATA_COLUMNS: &[&str] = &[
@@ -281,6 +285,90 @@ async fn write_subject(pool: &PgPool, subject: SubjectImport) -> Result<usize, s
     Ok(count)
 }
 
+async fn has_entry_status_table(pool: &PgPool) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>("SELECT to_regclass('forms.rpms_entry_status') IS NOT NULL")
+        .fetch_one(pool)
+        .await
+}
+
+async fn subject_entry_status_items(
+    pool: &PgPool,
+    subject_id: &str,
+) -> Result<Vec<EntryStatusItem>, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"
+        SELECT redcap_event_name, redcap_form_name, "CompletionStatus"
+        FROM forms.rpms_entry_status
+        WHERE subject_id = $1
+        "#,
+    )
+    .bind(subject_id)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(EntryStatusItem {
+                redcap_event_name: row.try_get("redcap_event_name")?,
+                redcap_form_name: row.try_get("redcap_form_name")?,
+                completion_status: row.try_get("CompletionStatus")?,
+            })
+        })
+        .collect()
+}
+
+async fn write_subject_form_completion_variables(
+    pool: &PgPool,
+    subject_id: &str,
+) -> ImportResult<usize> {
+    let cohort = match get_subject_cohort(subject_id, pool)
+        .await
+        .map_err(|error| io::Error::other(format!("failed to fetch subject cohort: {error}")))?
+    {
+        Some(cohort) => cohort,
+        None => {
+            warn!(
+                "unknown or missing cohort for subject {subject_id}, skipping form completion variables"
+            );
+            return Ok(0);
+        }
+    };
+
+    let entry_status_items = subject_entry_status_items(pool, subject_id).await?;
+    let records = get_subject_form_completion_variables(subject_id, &cohort, &entry_status_items)?;
+    if records.is_empty() {
+        return Ok(0);
+    }
+
+    let mut tx: Transaction<'_, Postgres> = pool.begin().await?;
+    sqlx::query("DELETE FROM forms.forms WHERE subject_id = $1 AND form_name = 'uncategorized'")
+        .bind(subject_id)
+        .execute(&mut *tx)
+        .await?;
+
+    for record in &records {
+        sqlx::query(
+            r#"
+            INSERT INTO forms.forms (
+                subject_id, form_name, event_name, form_data,
+                source_mdate, variables_with_data
+            ) VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+        )
+        .bind(&record.subject_id)
+        .bind(&record.form_name)
+        .bind(&record.event_name)
+        .bind(&record.form_data)
+        .bind(record.source_mdate)
+        .bind(record.variables_with_data)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(records.len())
+}
+
 fn subject_paths(data_root: &Path) -> ImportResult<Vec<PathBuf>> {
     info!("Looking for RPMS CSVs in {data_root:?}");
     let protected = data_root.join("PROTECTED");
@@ -307,10 +395,17 @@ async fn main() -> ImportResult<()> {
     let jobs = cli.jobs.max(1);
     let db_uri = std::env::var("DB_URI").map_err(|_| "DB_URI environment variable must be set")?;
     let pool = db::create_pool_with_options(&db_uri, cli.max_connections.unwrap_or(jobs as u32)).await?;
+    let entry_status_table_exists = has_entry_status_table(&pool).await?;
+    if !entry_status_table_exists {
+        warn!(
+            "forms.rpms_entry_status does not exist; skipping form completion variable generation"
+        );
+    }
     info!("Importing {} RPMS subjects with {jobs} concurrent workers", paths.len());
 
     let completed = Arc::new(AtomicUsize::new(0));
     let imported_forms = Arc::new(AtomicUsize::new(0));
+    let imported_completion_forms = Arc::new(AtomicUsize::new(0));
     let subjects = stream::iter(paths)
         .map(|path| async move {
             tokio::task::spawn_blocking(move || process_subject(path))
@@ -322,21 +417,49 @@ async fn main() -> ImportResult<()> {
         .await?;
 
     stream::iter(subjects)
-        .map(|subject| write_subject(&pool, subject))
+        .map(|subject| {
+            let pool = &pool;
+            async move {
+                let subject_id = subject.subject_id.clone();
+                let form_count = write_subject(pool, subject)
+                    .await
+                    .map_err(|error| -> Box<dyn Error + Send + Sync> { Box::new(error) })?;
+
+                let completion_count = if entry_status_table_exists && form_count > 0 {
+                    write_subject_form_completion_variables(pool, &subject_id).await?
+                } else {
+                    0
+                };
+
+                Ok::<(usize, usize), Box<dyn Error + Send + Sync>>((form_count, completion_count))
+            }
+        })
         .buffer_unordered(jobs)
-        .try_for_each(|count| {
+        .try_for_each(|(form_count, completion_count)| {
             let completed = Arc::clone(&completed);
             let imported_forms = Arc::clone(&imported_forms);
+            let imported_completion_forms = Arc::clone(&imported_completion_forms);
             async move {
                 let completed = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                let imported_forms = imported_forms.fetch_add(count, Ordering::Relaxed) + count;
-                if completed % 100 == 0 { info!("Processed {completed} subjects ({imported_forms} form rows)"); }
+                let imported_forms =
+                    imported_forms.fetch_add(form_count, Ordering::Relaxed) + form_count;
+                let imported_completion_forms = imported_completion_forms
+                    .fetch_add(completion_count, Ordering::Relaxed)
+                    + completion_count;
+                if completed % 100 == 0 {
+                    info!(
+                        "Processed {completed} subjects ({imported_forms} form rows, {imported_completion_forms} completion rows)"
+                    );
+                }
                 Ok(())
             }
         }).await?;
     pool.close().await;
     let completed = completed.load(Ordering::Relaxed);
     let imported_forms = imported_forms.load(Ordering::Relaxed);
-    info!("Imported {imported_forms} form rows for {completed} subjects");
+    let imported_completion_forms = imported_completion_forms.load(Ordering::Relaxed);
+    info!(
+        "Imported {imported_forms} form rows and {imported_completion_forms} completion rows for {completed} subjects"
+    );
     Ok(())
 }
