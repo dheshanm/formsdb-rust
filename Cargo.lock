@@ -719,6 +719,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ct-ampscz"
+version = "0.1.0"
+dependencies = [
+ "calamine",
+ "chrono",
+ "clap",
+ "csv",
+ "db",
+ "futures-util",
+ "indicatif",
+ "polars",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "tracing-indicatif",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "ctutils"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/db",
     "crates/ampscz",
+    "crates/ct-ampscz",
     "crates/mindlamp_gps",
 ]
 
