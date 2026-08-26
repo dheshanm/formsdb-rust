@@ -46,6 +46,15 @@ fn remove_html_tags(value: &str) -> String {
     cleaned
 }
 
+fn normalize_dictionary_cell(value: &str) -> Option<String> {
+    let cleaned = remove_html_tags(value);
+    if cleaned.trim().is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
 fn data_dictionary_dataframe<R: Read>(reader: R) -> ImportResult<DataFrame> {
     let mut reader = csv::ReaderBuilder::new().flexible(true).from_reader(reader);
     let headers = reader.headers()?.clone();
@@ -58,12 +67,12 @@ fn data_dictionary_dataframe<R: Read>(reader: R) -> ImportResult<DataFrame> {
     }
 
     let header_names = headers.iter().map(str::to_owned).collect::<Vec<_>>();
-    let mut values = vec![Vec::new(); header_names.len()];
+    let mut values = vec![Vec::<Option<String>>::new(); header_names.len()];
 
     for record in reader.records() {
         let record = record?;
         for (index, column) in values.iter_mut().enumerate() {
-            column.push(remove_html_tags(record.get(index).unwrap_or_default()));
+            column.push(normalize_dictionary_cell(record.get(index).unwrap_or_default()));
         }
     }
 
@@ -71,7 +80,13 @@ fn data_dictionary_dataframe<R: Read>(reader: R) -> ImportResult<DataFrame> {
     let columns = header_names
         .into_iter()
         .zip(values)
-        .map(|(name, values)| Column::new(name.into(), values))
+        .map(|(name, values)| {
+            let values = values
+                .iter()
+                .map(|value| value.as_deref())
+                .collect::<Vec<_>>();
+            Column::new(name.into(), values)
+        })
         .collect::<Vec<_>>();
 
     Ok(DataFrame::new(row_count, columns)?)
@@ -128,7 +143,7 @@ mod tests {
     }
 
     #[test]
-    fn cleans_every_column_and_preserves_blank_values() {
+    fn cleans_every_column_and_maps_blank_values_to_nulls() {
         let dataframe = data_dictionary_dataframe(Cursor::new(
             "field_name,field_label,choices\nfield_one,<p>First <b>label</b></p>,\"1, <i>Yes</i> | 0, No\"\nfield_two,,<span>value</span>\n",
         ))
@@ -151,7 +166,7 @@ mod tests {
                 .str()
                 .unwrap()
                 .get(1),
-            Some("")
+            None
         );
         assert_eq!(
             dataframe.column("choices").unwrap().str().unwrap().get(0),

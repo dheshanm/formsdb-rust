@@ -107,6 +107,14 @@ fn is_missing_value(value: &str) -> bool {
     )
 }
 
+fn non_empty_csv_value(value: &str) -> Option<&str> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
 fn process_form(path: &Path) -> ImportResult<Vec<OutcomeRow>> {
     let subject_id = path
         .parent()
@@ -181,6 +189,31 @@ fn rows_to_dataframe(rows: Vec<OutcomeRow>) -> ImportResult<DataFrame> {
 
     let source_m_dates = Column::new("source_m_date".into(), source_m_dates)
         .cast(&DataType::Datetime(TimeUnit::Milliseconds, None))?;
+
+    let subject_ids = subject_ids
+        .iter()
+        .map(|value| non_empty_csv_value(value))
+        .collect::<Vec<_>>();
+    let form_names = form_names
+        .iter()
+        .map(|value| non_empty_csv_value(value))
+        .collect::<Vec<_>>();
+    let event_names = event_names
+        .iter()
+        .map(|value| non_empty_csv_value(value))
+        .collect::<Vec<_>>();
+    let variables = variables
+        .iter()
+        .map(|value| non_empty_csv_value(value))
+        .collect::<Vec<_>>();
+    let values = values
+        .iter()
+        .map(|value| non_empty_csv_value(value))
+        .collect::<Vec<_>>();
+    let data_types = data_types
+        .iter()
+        .map(|value| non_empty_csv_value(value))
+        .collect::<Vec<_>>();
 
     Ok(DataFrame::new(
         height,
@@ -354,5 +387,24 @@ mod tests {
         let error = process_form(&csv).unwrap_err();
         assert!(error.to_string().contains("redcap_event_name"));
         fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn dataframe_maps_blank_cells_to_nulls() {
+        let rows = vec![OutcomeRow {
+            subject_id: "AB001".to_owned(),
+            form_name: "test_outcomes".to_owned(),
+            redcap_event_name: "".to_owned(),
+            variable: "   ".to_owned(),
+            value: "".to_owned(),
+            data_type: " ".to_owned(),
+            source_m_date: DateTime::<Utc>::from(SystemTime::UNIX_EPOCH),
+        }];
+
+        let dataframe = rows_to_dataframe(rows).unwrap();
+        assert_eq!(dataframe.column("redcap_event_name").unwrap().null_count(), 1);
+        assert_eq!(dataframe.column("variable").unwrap().null_count(), 1);
+        assert_eq!(dataframe.column("value").unwrap().null_count(), 1);
+        assert_eq!(dataframe.column("data_type").unwrap().null_count(), 1);
     }
 }

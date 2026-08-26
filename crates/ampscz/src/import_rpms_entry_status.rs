@@ -146,6 +146,14 @@ fn normalize_row(mut row: CsvRow) -> CsvRow {
     row
 }
 
+fn non_empty_csv_value(value: &str) -> Option<&str> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
 fn rows_to_dataframe(rows: &[CsvRow]) -> ImportResult<DataFrame> {
     let columns = rows
         .iter()
@@ -161,7 +169,7 @@ fn rows_to_dataframe(rows: &[CsvRow]) -> ImportResult<DataFrame> {
         .map(|name| {
             let values = rows
                 .iter()
-                .map(|row| row.get(&name).map(String::as_str))
+                .map(|row| row.get(&name).and_then(|value| non_empty_csv_value(value)))
                 .collect::<Vec<_>>();
             Column::new(name.into(), values)
         })
@@ -431,6 +439,17 @@ mod tests {
             dataframe.column("second").unwrap().str().unwrap().get(0),
             None
         );
+    }
+
+    #[test]
+    fn dataframe_maps_blank_cells_to_nulls() {
+        let dataframe = rows_to_dataframe(&[
+            row(&[("subject_id", "AB001"), ("CompletionStatus", "")]),
+            row(&[("subject_id", "AB002"), ("CompletionStatus", "   ")]),
+        ])
+        .unwrap();
+
+        assert_eq!(dataframe.column("CompletionStatus").unwrap().null_count(), 2);
     }
 
     #[test]
