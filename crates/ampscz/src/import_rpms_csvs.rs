@@ -91,12 +91,14 @@ fn read_csv(path: &Path) -> ImportResult<Vec<BTreeMap<String, String>>> {
 
 fn parse_rpms_datetime(value: &str) -> Option<DateTime<Utc>> {
     let naive = if value.len() == 10 {
-        NaiveDate::parse_from_str(value, "%m/%d/%Y")
-            .or_else(|_| NaiveDate::parse_from_str(value, "%d/%m/%Y"))
+        NaiveDate::parse_from_str(value, "%d/%m/%Y")
+            .or_else(|_| NaiveDate::parse_from_str(value, "%m/%d/%Y"))
             .ok()?
             .and_hms_opt(0, 0, 0)?
     } else if value.len() > 10 {
-        NaiveDateTime::parse_from_str(value, "%d/%m/%Y %I:%M:%S %p").ok()?
+        NaiveDateTime::parse_from_str(value, "%d/%m/%Y %I:%M:%S %p")
+            .or_else(|_| NaiveDateTime::parse_from_str(value, "%m/%d/%Y %I:%M:%S %p"))
+            .ok()?
     } else {
         return None;
     };
@@ -543,4 +545,78 @@ async fn main() -> ImportResult<()> {
         "Imported {imported_forms} form rows and {imported_completion_forms} completion rows for {completed} subjects"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_day_first_rpms_dates() {
+        // Ambiguous date 04/03/2024 should parse as 4th of March, 2024 (dd/mm/yyyy), not 3rd of April
+        let parsed = parse_rpms_datetime("04/03/2024").unwrap();
+        assert_eq!(
+            parsed,
+            DateTime::<Utc>::from_naive_utc_and_offset(
+                NaiveDate::from_ymd_opt(2024, 3, 4)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap(),
+                Utc
+            )
+        );
+
+        // Day > 12 should parse correctly as dd/mm/yyyy
+        let parsed = parse_rpms_datetime("18/09/2024").unwrap();
+        assert_eq!(
+            parsed,
+            DateTime::<Utc>::from_naive_utc_and_offset(
+                NaiveDate::from_ymd_opt(2024, 9, 18)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap(),
+                Utc
+            )
+        );
+
+        // Fallback: mm/dd/yyyy when first component > 12
+        let parsed = parse_rpms_datetime("11/30/2022").unwrap();
+        assert_eq!(
+            parsed,
+            DateTime::<Utc>::from_naive_utc_and_offset(
+                NaiveDate::from_ymd_opt(2022, 11, 30)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap(),
+                Utc
+            )
+        );
+    }
+
+    #[test]
+    fn parses_rpms_datetimes_with_time() {
+        let parsed = parse_rpms_datetime("18/09/2024 3:51:49 AM").unwrap();
+        assert_eq!(
+            parsed,
+            DateTime::<Utc>::from_naive_utc_and_offset(
+                NaiveDate::from_ymd_opt(2024, 9, 18)
+                    .unwrap()
+                    .and_hms_opt(3, 51, 49)
+                    .unwrap(),
+                Utc
+            )
+        );
+
+        let parsed = parse_rpms_datetime("04/03/2024 1:53:00 PM").unwrap();
+        assert_eq!(
+            parsed,
+            DateTime::<Utc>::from_naive_utc_and_offset(
+                NaiveDate::from_ymd_opt(2024, 3, 4)
+                    .unwrap()
+                    .and_hms_opt(13, 53, 0)
+                    .unwrap(),
+                Utc
+            )
+        );
+    }
 }
