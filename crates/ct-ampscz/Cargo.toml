@@ -7,6 +7,10 @@ edition.workspace = true
 name = "ingest_cantab_data_review"
 path = "src/ingest_cantab_data_review.rs"
 
+[[bin]]
+name = "ingest_eeg_qc"
+path = "src/ingest_eeg_qc.rs"
+
 
 [dependencies]
 calamine = { workspace = true }
