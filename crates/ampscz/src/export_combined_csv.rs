@@ -26,6 +26,7 @@ const DERIVED_COLUMNS: &[&str] = &[
 	"visit_completed",
 	"converted",
 	"converted_visit",
+	"conversion_date",
 	"removed",
 	"removed_visit",
 	"removed_date",
