@@ -19,8 +19,11 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use clap::Parser;
 use futures_util::{stream, StreamExt, TryStreamExt};
 use serde_json::{Map, Number, Value};
+use indicatif::ProgressStyle;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use tracing::{info, warn};
+use tracing_indicatif::{IndicatifLayer, span_ext::IndicatifSpanExt};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 const IGNORED_METADATA_COLUMNS: &[&str] = &[
     "LastModifiedDate",
@@ -30,6 +33,7 @@ const IGNORED_METADATA_COLUMNS: &[&str] = &[
     "gender",
     "visit",
 ];
+const DEFAULT_LOG_FREQ: usize = 100;
 
 /// Import all RPMS CSVs into the database.
 /// Required environment variable: DB_URI.
@@ -387,12 +391,50 @@ fn subject_paths(data_root: &Path) -> ImportResult<Vec<PathBuf>> {
     Ok(paths)
 }
 
+fn parse_log_frequency(raw: Option<&str>) -> ImportResult<usize> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_LOG_FREQ);
+    };
+    let frequency = raw
+        .parse::<usize>()
+        .map_err(|_| format!("LOG_FREQ must be a positive integer, got {raw:?}"))?;
+    if frequency == 0 {
+        return Err("LOG_FREQ must be greater than zero".into());
+    }
+    Ok(frequency)
+}
+
+fn log_frequency() -> ImportResult<usize> {
+    match std::env::var("LOG_FREQ") {
+        Ok(raw) => parse_log_frequency(Some(&raw)),
+        Err(std::env::VarError::NotPresent) => parse_log_frequency(None),
+        Err(error) => Err(format!("failed to read LOG_FREQ: {error}").into()),
+    }
+}
+
 #[tokio::main]
 async fn main() -> ImportResult<()> {
-    tracing_subscriber::fmt::init(); 
+    let indicatif_layer = IndicatifLayer::new();
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(tracing_subscriber::fmt::layer().with_writer(indicatif_layer.get_stderr_writer()))
+        .with(indicatif_layer)
+        .init();
+
     let cli = Cli::parse();
+
+    let discovery_span = tracing::info_span!("looking_for_rpms_csvs");
+    discovery_span
+        .pb_set_style(&ProgressStyle::with_template("{spinner:.green} {msg}").expect("valid template"));
+    discovery_span.pb_set_message("Looking for RPMS subject CSVs");
+    let _discovery_enter = discovery_span.enter();
     let paths = subject_paths(&cli.data_root)?;
+    drop(_discovery_enter);
+    drop(discovery_span);
+
     let jobs = cli.jobs.max(1);
+    let log_freq = log_frequency()?;
+    info!(log_freq, "Logging RPMS CSV progress");
     let db_uri = std::env::var("DB_URI").map_err(|_| "DB_URI environment variable must be set")?;
     let pool = db::create_pool_with_options(&db_uri, cli.max_connections.unwrap_or(jobs as u32)).await?;
     let entry_status_table_exists = has_entry_status_table(&pool).await?;
@@ -401,20 +443,52 @@ async fn main() -> ImportResult<()> {
             "forms.rpms_entry_status does not exist; skipping form completion variable generation"
         );
     }
+
+    let progress_style = ProgressStyle::default_bar()
+        .template("{span_child_prefix}{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) {msg}")
+        .expect("valid template")
+        .progress_chars("#>-");
+
     info!("Importing {} RPMS subjects with {jobs} concurrent workers", paths.len());
 
     let completed = Arc::new(AtomicUsize::new(0));
     let imported_forms = Arc::new(AtomicUsize::new(0));
     let imported_completion_forms = Arc::new(AtomicUsize::new(0));
-    let subjects = stream::iter(paths)
+
+    let parse_span = tracing::info_span!("parsing_rpms_subjects");
+    parse_span.pb_set_style(&progress_style);
+    parse_span.pb_set_length(paths.len() as u64);
+    parse_span.pb_set_message("Parsing RPMS subject CSVs");
+    let _parse_enter = parse_span.enter();
+    let total_to_parse = paths.len();
+
+    let mut subject_stream = stream::iter(paths)
         .map(|path| async move {
             tokio::task::spawn_blocking(move || process_subject(path))
                 .await
                 .map_err(|error| -> Box<dyn Error + Send + Sync> { Box::new(error) })?
         })
-        .buffer_unordered(jobs)
-        .try_collect::<Vec<_>>()
-        .await?;
+        .buffer_unordered(jobs);
+
+    let mut subjects = Vec::with_capacity(total_to_parse);
+    while let Some(subject) = subject_stream.try_next().await? {
+        subjects.push(subject);
+        parse_span.pb_inc(1);
+        let parsed = subjects.len();
+        if parsed % log_freq == 0 || parsed == total_to_parse {
+            info!(parsed, total = total_to_parse, "Parsed RPMS subjects");
+        }
+    }
+
+    drop(_parse_enter);
+    drop(parse_span);
+
+    let total_to_write = subjects.len();
+    let write_span = tracing::info_span!("writing_rpms_subjects");
+    write_span.pb_set_style(&progress_style);
+    write_span.pb_set_length(total_to_write as u64);
+    write_span.pb_set_message("Writing RPMS forms to DB");
+    let _write_enter = write_span.enter();
 
     stream::iter(subjects)
         .map(|subject| {
@@ -439,6 +513,7 @@ async fn main() -> ImportResult<()> {
             let completed = Arc::clone(&completed);
             let imported_forms = Arc::clone(&imported_forms);
             let imported_completion_forms = Arc::clone(&imported_completion_forms);
+            let write_span = write_span.clone();
             async move {
                 let completed = completed.fetch_add(1, Ordering::Relaxed) + 1;
                 let imported_forms =
@@ -446,14 +521,20 @@ async fn main() -> ImportResult<()> {
                 let imported_completion_forms = imported_completion_forms
                     .fetch_add(completion_count, Ordering::Relaxed)
                     + completion_count;
-                if completed % 100 == 0 {
+                write_span.pb_inc(1);
+                if completed % log_freq == 0 || completed == total_to_write {
                     info!(
+                        total = total_to_write,
                         "Processed {completed} subjects ({imported_forms} form rows, {imported_completion_forms} completion rows)"
                     );
                 }
                 Ok(())
             }
-        }).await?;
+        })
+        .await?;
+    drop(_write_enter);
+    drop(write_span);
+
     pool.close().await;
     let completed = completed.load(Ordering::Relaxed);
     let imported_forms = imported_forms.load(Ordering::Relaxed);
