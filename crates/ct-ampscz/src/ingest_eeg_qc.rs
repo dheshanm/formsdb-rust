@@ -10,6 +10,8 @@ use tracing::info;
 
 type ImportResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
+const EEG_DAY_EARLY_WITHDRAWAL_SENTINEL: i32 = -999;
+
 /// Ingest EEG QC data from a CSV file into PostgreSQL (`eeg.qc`).
 /// Required environment variable: DB_URI.
 #[derive(Parser, Debug)]
@@ -70,6 +72,7 @@ fn map_redcap_event(eeg_day: i32) -> String {
         -1 => "day_1_arm_1".to_owned(),
         29 => "day_29_arm_1".to_owned(),
         56 => "day_56_arm_1".to_owned(),
+        EEG_DAY_EARLY_WITHDRAWAL_SENTINEL => "early_withdrawal_arm_1".to_owned(),
         _ => "unknown_event".to_owned(),
     }
 }
@@ -109,6 +112,22 @@ fn parse_eeg_date(raw_date: &str) -> ImportResult<NaiveDate> {
         .map_err(|e| format!("invalid date format '{trimmed}' (expected YYYY_MM_DD): {e}").into())
 }
 
+fn parse_eeg_day(raw_day: &str, row_number: usize) -> ImportResult<i32> {
+    let trimmed = raw_day.trim();
+    if trimmed.eq_ignore_ascii_case("nan")
+        || trimmed.eq_ignore_ascii_case("null")
+        || trimmed.eq_ignore_ascii_case("none")
+        || trimmed.eq_ignore_ascii_case("na")
+    {
+        return Ok(EEG_DAY_EARLY_WITHDRAWAL_SENTINEL);
+    }
+
+    trimmed
+        .parse::<i32>()
+        .or_else(|_| trimmed.parse::<f64>().map(|f| f as i32))
+        .map_err(|e| format!("row {row_number}: invalid eegDay '{trimmed}': {e}").into())
+}
+
 fn read_eeg_qc_rows(path: &Path) -> ImportResult<Vec<EegQcRecord>> {
     let mut reader = csv::ReaderBuilder::new().flexible(true).from_path(path)?;
     let headers = reader.headers()?.clone();
@@ -144,10 +163,7 @@ fn read_eeg_qc_rows(path: &Path) -> ImportResult<Vec<EegQcRecord>> {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| format!("row {row_number}: missing required value in column 'eegDay'"))?;
-        let eeg_day: i32 = eeg_day_raw
-            .parse::<i32>()
-            .or_else(|_| eeg_day_raw.parse::<f64>().map(|f| f as i32))
-            .map_err(|e| format!("row {row_number}: invalid eegDay '{eeg_day_raw}': {e}"))?;
+        let eeg_day = parse_eeg_day(eeg_day_raw, row_number)?;
 
         let n_sheet_raw = record
             .get(n_sheet_index)
@@ -276,7 +292,25 @@ mod tests {
         assert_eq!(map_redcap_event(-1), "day_1_arm_1");
         assert_eq!(map_redcap_event(29), "day_29_arm_1");
         assert_eq!(map_redcap_event(56), "day_56_arm_1");
+        assert_eq!(
+            map_redcap_event(EEG_DAY_EARLY_WITHDRAWAL_SENTINEL),
+            "early_withdrawal_arm_1"
+        );
         assert_eq!(map_redcap_event(100), "unknown_event");
+    }
+
+    #[test]
+    fn test_parse_eeg_day() {
+        assert_eq!(parse_eeg_day("-1", 2).unwrap(), -1);
+        assert_eq!(
+            parse_eeg_day("NaN", 2).unwrap(),
+            EEG_DAY_EARLY_WITHDRAWAL_SENTINEL
+        );
+        assert_eq!(
+            parse_eeg_day("na", 2).unwrap(),
+            EEG_DAY_EARLY_WITHDRAWAL_SENTINEL
+        );
+        assert!(parse_eeg_day("abc", 2).is_err());
     }
 
     #[test]
