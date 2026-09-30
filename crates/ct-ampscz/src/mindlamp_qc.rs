@@ -62,7 +62,7 @@ const INIT_QUERIES: &[&str] = &[
         mindlamp_id TEXT NOT NULL,
         subject_id TEXT NOT NULL,
         data_date DATE NOT NULL,
-        data_type TEXT NOT NULL CHECK (data_type IN ('activity', 'sensor')),
+        data_type TEXT NOT NULL,
         qc_metrics JSONB NOT NULL,
         source_file_path TEXT NOT NULL,
         PRIMARY KEY (subject_id, mindlamp_id, data_type, data_date),
