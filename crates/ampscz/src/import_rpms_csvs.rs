@@ -91,8 +91,8 @@ fn read_csv(path: &Path) -> ImportResult<Vec<BTreeMap<String, String>>> {
 
 fn parse_rpms_datetime(value: &str) -> Option<DateTime<Utc>> {
     let naive = if value.len() == 10 {
-        NaiveDate::parse_from_str(value, "%d/%m/%Y")
-            .or_else(|_| NaiveDate::parse_from_str(value, "%m/%d/%Y"))
+        NaiveDate::parse_from_str(value, "%m/%d/%Y")
+            .or_else(|_| NaiveDate::parse_from_str(value, "%d/%m/%Y"))
             .ok()?
             .and_hms_opt(0, 0, 0)?
     } else if value.len() > 10 {
