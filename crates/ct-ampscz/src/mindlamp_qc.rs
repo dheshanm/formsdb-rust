@@ -65,6 +65,7 @@ const INIT_QUERIES: &[&str] = &[
         data_type TEXT NOT NULL,
         qc_metrics JSONB NOT NULL,
         source_file_path TEXT NOT NULL,
+        ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         PRIMARY KEY (subject_id, mindlamp_id, data_type, data_date),
         FOREIGN KEY (subject_id) REFERENCES public.subjects(subject_id) ON DELETE CASCADE
     );"#,
@@ -602,7 +603,8 @@ INSERT INTO mindlamp.file_qc (
 ) VALUES ($1, $2, $3, $4, $5, $6)
 ON CONFLICT (subject_id, mindlamp_id, data_type, data_date) DO UPDATE SET
     qc_metrics = EXCLUDED.qc_metrics,
-    source_file_path = EXCLUDED.source_file_path;
+    source_file_path = EXCLUDED.source_file_path,
+    ingested_at = NOW();
     "#;
 
     sqlx::query(query)
