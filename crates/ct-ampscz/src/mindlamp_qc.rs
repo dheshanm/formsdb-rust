@@ -12,8 +12,8 @@ use clap::Parser;
 use futures_util::{StreamExt, stream};
 use indicatif::ProgressStyle;
 use serde::{
-    Deserialize, Deserializer,
-    de::{IgnoredAny, SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
+    de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor},
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, types::Json};
@@ -220,32 +220,202 @@ fn count_activity_events(contents: &[u8]) -> ImportResult<u64> {
     Ok(events.len() as u64)
 }
 
-/// Only the `sensor` field of a sensor entry is needed; `data` and
-/// `timestamp` are skipped without being materialized.
+/// Only `sensor` and the device fields of `data` are needed; everything else
+/// (including the bulk of `data` and `timestamp`) is skipped without being
+/// materialized.
 #[derive(Deserialize)]
-struct SensorKey {
+struct SensorEntry {
     #[serde(default)]
     sensor: Option<String>,
+    #[serde(default)]
+    data: DeviceFields,
 }
 
-/// Per-sensor entry counts, built while streaming over the top-level array so
-/// large sensor files never become a `Vec` of entries.
-struct SensorCounts(BTreeMap<String, u64>);
+/// `device_type` / `user_agent` from an entry's `data` object (present on
+/// `lamp.analytics` entries). Any other shape of `data` is ignored rather
+/// than rejected.
+#[derive(Debug, Default)]
+struct DeviceFields {
+    device_type: Option<String>,
+    user_agent: Option<String>,
+}
 
-impl<'de> Deserialize<'de> for SensorCounts {
+impl<'de> Deserialize<'de> for DeviceFields {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct CountingVisitor;
+        #[derive(Deserialize)]
+        #[serde(field_identifier, rename_all = "snake_case")]
+        enum Field {
+            DeviceType,
+            UserAgent,
+            #[serde(other)]
+            Other,
+        }
 
-        impl<'de> Visitor<'de> for CountingVisitor {
-            type Value = SensorCounts;
+        struct DeviceFieldsVisitor;
+
+        impl<'de> Visitor<'de> for DeviceFieldsVisitor {
+            type Value = DeviceFields;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("any JSON value")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut fields = DeviceFields::default();
+                while let Some(key) = map.next_key::<Field>()? {
+                    match key {
+                        Field::DeviceType => fields.device_type = map.next_value()?,
+                        Field::UserAgent => fields.user_agent = map.next_value()?,
+                        Field::Other => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(fields)
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(DeviceFields::default())
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(DeviceFields::default())
+            }
+
+            fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(DeviceFields::default())
+            }
+
+            fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(DeviceFields::default())
+            }
+
+            fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(DeviceFields::default())
+            }
+
+            fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(DeviceFields::default())
+            }
+
+            fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(DeviceFields::default())
+            }
+        }
+
+        deserializer.deserialize_any(DeviceFieldsVisitor)
+    }
+}
+
+/// A `user_agent` string split into its parts. Mindlamp's native app reports
+/// `<app> <version>; <os> <version>; <manufacturer>; <model>` on Android and
+/// `<app> <version>; iOS <version>; iPhone <model identifier>` on iOS. Other
+/// agents (e.g. the web dashboard) keep only `raw`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct UserAgent {
+    raw: String,
+    app_name: Option<String>,
+    app_version: Option<String>,
+    os_name: Option<String>,
+    os_version: Option<String>,
+    manufacturer: Option<String>,
+    model: Option<String>,
+}
+
+impl UserAgent {
+    fn parse(raw: &str) -> Self {
+        let unparsed = UserAgent {
+            raw: raw.to_owned(),
+            ..Default::default()
+        };
+        let segments: Vec<&str> = raw.split(';').map(str::trim).collect();
+        let (app, os, device) = match segments[..] {
+            [app, os, manufacturer, model] => (app, os, Some((manufacturer, model))),
+            [app, os, device] => (app, os, device.split_once(' ')),
+            _ => return unparsed,
+        };
+        let (Some((app_name, app_version)), Some((os_name, os_version))) =
+            (app.split_once(' '), os.split_once(' '))
+        else {
+            return unparsed;
+        };
+
+        // iOS reports the device family ("iPhone") in place of a manufacturer.
+        let (manufacturer, model) = match device {
+            Some((_, model)) if os_name == "iOS" => (Some("Apple"), Some(model)),
+            Some((manufacturer, model)) => (Some(manufacturer), Some(model)),
+            None => (None, None),
+        };
+
+        let owned = |s: Option<&str>| {
+            s.map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        };
+        UserAgent {
+            raw: raw.to_owned(),
+            app_name: owned(Some(app_name)),
+            app_version: owned(Some(app_version)),
+            os_name: owned(Some(os_name)),
+            os_version: owned(Some(os_version)),
+            manufacturer: owned(manufacturer),
+            model: owned(model),
+        }
+    }
+}
+
+/// One distinct `(device_type, user_agent)` pair seen in a sensor file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct DeviceQc {
+    device_type: Option<String>,
+    user_agent: Option<UserAgent>,
+    num_events: u64,
+}
+
+/// Per-sensor entry counts and per-device counts, built while streaming over
+/// the top-level array so large sensor files never become a `Vec` of entries.
+#[derive(Debug, Default)]
+struct SensorSummary {
+    /// Entry counts per sensor (with the `lamp.` prefix stripped).
+    sensor_counts: BTreeMap<String, u64>,
+    /// Entry counts per `(device_type, user_agent)`, for entries carrying
+    /// either field.
+    device_counts: BTreeMap<(Option<String>, Option<String>), u64>,
+}
+
+impl SensorSummary {
+    /// Distinct devices, most frequent first.
+    fn devices(&self) -> Vec<DeviceQc> {
+        let mut devices: Vec<DeviceQc> = self
+            .device_counts
+            .iter()
+            .map(|((device_type, user_agent), &num_events)| DeviceQc {
+                device_type: device_type.clone(),
+                user_agent: user_agent.as_deref().map(UserAgent::parse),
+                num_events,
+            })
+            .collect();
+        // Stable sort keeps the BTreeMap order among equal counts.
+        devices.sort_by_key(|d| std::cmp::Reverse(d.num_events));
+        devices
+    }
+}
+
+impl<'de> Deserialize<'de> for SensorSummary {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct SummaryVisitor;
+
+        impl<'de> Visitor<'de> for SummaryVisitor {
+            type Value = SensorSummary;
 
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
                 f.write_str("an array of sensor entries")
             }
 
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-                let mut counts = BTreeMap::new();
-                while let Some(entry) = seq.next_element::<SensorKey>()? {
+                let mut summary = SensorSummary::default();
+                while let Some(entry) = seq.next_element::<SensorEntry>()? {
                     let name = match entry.sensor {
                         Some(sensor) => sensor
                             .strip_prefix(SENSOR_PREFIX)
@@ -253,20 +423,29 @@ impl<'de> Deserialize<'de> for SensorCounts {
                             .unwrap_or(sensor),
                         None => UNKNOWN_SENSOR.to_owned(),
                     };
-                    *counts.entry(name).or_insert(0) += 1;
+                    *summary.sensor_counts.entry(name).or_insert(0) += 1;
+
+                    let DeviceFields {
+                        device_type,
+                        user_agent,
+                    } = entry.data;
+                    if device_type.is_some() || user_agent.is_some() {
+                        *summary
+                            .device_counts
+                            .entry((device_type, user_agent))
+                            .or_insert(0) += 1;
+                    }
                 }
-                Ok(SensorCounts(counts))
+                Ok(summary)
             }
         }
 
-        deserializer.deserialize_seq(CountingVisitor)
+        deserializer.deserialize_seq(SummaryVisitor)
     }
 }
 
-/// Entry counts per sensor (with the `lamp.` prefix stripped).
-fn count_sensor_events(contents: &[u8]) -> ImportResult<BTreeMap<String, u64>> {
-    let SensorCounts(counts) = serde_json::from_slice(contents)?;
-    Ok(counts)
+fn summarize_sensor_events(contents: &[u8]) -> ImportResult<SensorSummary> {
+    Ok(serde_json::from_slice(contents)?)
 }
 
 fn build_qc_metrics(
@@ -281,10 +460,11 @@ fn build_qc_metrics(
             "file_modified_at": state.file_modified_at,
         }),
         DataType::Sensor => {
-            let sensor_counts = count_sensor_events(contents)?;
+            let summary = summarize_sensor_events(contents)?;
             json!({
-                "num_events": sensor_counts.values().sum::<u64>(),
-                "sensor_counts": sensor_counts,
+                "num_events": summary.sensor_counts.values().sum::<u64>(),
+                "sensor_counts": summary.sensor_counts,
+                "devices": summary.devices(),
                 "file_size_bytes": state.file_size_bytes,
                 "file_modified_at": state.file_modified_at,
             })
@@ -692,7 +872,7 @@ mod tests {
     }
 
     #[test]
-    fn test_count_sensor_events() {
+    fn test_summarize_sensor_events() {
         let contents = br#"[
             {"data": {"x": 1.0, "y": 2.0, "z": 3.0}, "sensor": "lamp.accelerometer", "timestamp": 1},
             {"data": {"x": 1.0, "y": 2.0, "z": 3.0}, "sensor": "lamp.accelerometer", "timestamp": 2},
@@ -700,7 +880,8 @@ mod tests {
             {"data": {}, "sensor": "phone_state", "timestamp": 4},
             {"data": {}, "timestamp": 5}
         ]"#;
-        let counts = count_sensor_events(contents).unwrap();
+        let summary = summarize_sensor_events(contents).unwrap();
+        let counts = summary.sensor_counts;
         let expected: BTreeMap<String, u64> = [
             ("accelerometer".to_owned(), 2),
             ("gps".to_owned(), 1),
@@ -710,8 +891,105 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(counts, expected);
-        assert!(count_sensor_events(b"[]").unwrap().is_empty());
-        assert!(count_sensor_events(b"not json").is_err());
+        assert!(summary.device_counts.is_empty());
+        let empty = summarize_sensor_events(b"[]").unwrap();
+        assert!(empty.sensor_counts.is_empty() && empty.device_counts.is_empty());
+        assert!(summarize_sensor_events(b"not json").is_err());
+    }
+
+    #[test]
+    fn test_summarize_sensor_events_devices() {
+        let android = "NativeCore 2025.03.20; Android 16; Google; Pixel 7a";
+        let contents = format!(
+            r#"[
+            {{"data": {{"device_type": "Android", "value": 0, "user_agent": "{android}", "type": "lowpowermode"}}, "sensor": "lamp.analytics", "timestamp": 1}},
+            {{"data": {{"type": "login", "device_token": "abc", "device_type": "Android", "user_agent": "{android}"}}, "sensor": "lamp.analytics", "timestamp": 2}},
+            {{"data": {{"type": "login", "device_type": "Dashboard", "user_agent": "LAMP-dashboard/dev Mozilla/5.0"}}, "sensor": "lamp.analytics", "timestamp": 3}},
+            {{"data": {{"device_type": "iOS"}}, "sensor": "lamp.analytics", "timestamp": 4}},
+            {{"data": {{"x": 1.0}}, "sensor": "lamp.accelerometer", "timestamp": 5}},
+            {{"data": null, "sensor": "lamp.gps", "timestamp": 6}},
+            {{"data": [1, 2], "sensor": "lamp.gps", "timestamp": 7}},
+            {{"data": "text", "sensor": "lamp.gps", "timestamp": 8}},
+            {{"sensor": "lamp.gps", "timestamp": 9}}
+        ]"#
+        );
+        let summary = summarize_sensor_events(contents.as_bytes()).unwrap();
+        assert_eq!(summary.sensor_counts.values().sum::<u64>(), 9);
+        assert_eq!(
+            serde_json::to_value(summary.devices()).unwrap(),
+            json!([
+                {
+                    "device_type": "Android",
+                    "user_agent": {
+                        "raw": android,
+                        "app_name": "NativeCore",
+                        "app_version": "2025.03.20",
+                        "os_name": "Android",
+                        "os_version": "16",
+                        "manufacturer": "Google",
+                        "model": "Pixel 7a",
+                    },
+                    "num_events": 2,
+                },
+                {
+                    "device_type": "Dashboard",
+                    "user_agent": {
+                        "raw": "LAMP-dashboard/dev Mozilla/5.0",
+                        "app_name": null,
+                        "app_version": null,
+                        "os_name": null,
+                        "os_version": null,
+                        "manufacturer": null,
+                        "model": null,
+                    },
+                    "num_events": 1,
+                },
+                {"device_type": "iOS", "user_agent": null, "num_events": 1},
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_user_agent() {
+        let ua = UserAgent::parse("NativeCore 2023.5.2; iOS 26.6.2; iPhone iPhone17,1");
+        assert_eq!(
+            ua,
+            UserAgent {
+                raw: "NativeCore 2023.5.2; iOS 26.6.2; iPhone iPhone17,1".to_owned(),
+                app_name: Some("NativeCore".to_owned()),
+                app_version: Some("2023.5.2".to_owned()),
+                os_name: Some("iOS".to_owned()),
+                os_version: Some("26.6.2".to_owned()),
+                manufacturer: Some("Apple".to_owned()),
+                model: Some("iPhone17,1".to_owned()),
+            }
+        );
+
+        let ua = UserAgent::parse(
+            "NativeCore 2026.05.17; Android 16; motorola; motorola razr plus 2024",
+        );
+        assert_eq!(ua.manufacturer.as_deref(), Some("motorola"));
+        assert_eq!(ua.model.as_deref(), Some("motorola razr plus 2024"));
+        assert_eq!(ua.os_version.as_deref(), Some("16"));
+
+        let ua = UserAgent::parse("NativeCore 2025.03.20; Android 16; samsung; SM-S936U1");
+        assert_eq!(ua.manufacturer.as_deref(), Some("samsung"));
+        assert_eq!(ua.model.as_deref(), Some("SM-S936U1"));
+
+        // Unrecognized formats keep only the raw string
+        for raw in [
+            "LAMP-dashboard/dev Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
+            "NativeCore",
+            "",
+        ] {
+            assert_eq!(
+                UserAgent::parse(raw),
+                UserAgent {
+                    raw: raw.to_owned(),
+                    ..Default::default()
+                }
+            );
+        }
     }
 
     #[test]
@@ -728,6 +1006,7 @@ mod tests {
             json!({
                 "num_events": 2,
                 "sensor_counts": {"gps": 2},
+                "devices": [],
                 "file_size_bytes": 123,
                 "file_modified_at": "2026-03-12T05:00:00Z",
             })
