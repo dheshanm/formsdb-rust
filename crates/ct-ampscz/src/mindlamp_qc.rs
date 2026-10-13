@@ -54,6 +54,12 @@ struct Cli {
     /// time match the stored QC row.
     #[arg(long)]
     force: bool,
+
+    /// Exit successfully even if some files fail QC. Failures are still
+    /// logged as warnings and counted in the summary. Fatal errors (DB,
+    /// glob, init) still exit non-zero.
+    #[arg(long)]
+    allow_file_errors: bool,
 }
 
 const INIT_QUERIES: &[&str] = &[
@@ -749,11 +755,15 @@ async fn main() -> ImportResult<()> {
     pool.close().await;
 
     if summary.failed > 0 {
-        return Err(format!(
+        let msg = format!(
             "{} file(s) failed QC ingestion; see warnings above",
             summary.failed
-        )
-        .into());
+        );
+        if cli.allow_file_errors {
+            warn!(failed = summary.failed, "{msg}");
+        } else {
+            return Err(msg.into());
+        }
     }
     Ok(())
 }
