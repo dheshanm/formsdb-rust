@@ -552,13 +552,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_day_first_rpms_dates() {
-        // Ambiguous date 04/03/2024 should parse as 4th of March, 2024 (dd/mm/yyyy), not 3rd of April
+    fn parses_month_first_rpms_dates() {
+        // RPMS date-only fields are mm/dd/yyyy: ambiguous 04/03/2024 is 3rd of April, not 4th of March
         let parsed = parse_rpms_datetime("04/03/2024").unwrap();
         assert_eq!(
             parsed,
             DateTime::<Utc>::from_naive_utc_and_offset(
-                NaiveDate::from_ymd_opt(2024, 3, 4)
+                NaiveDate::from_ymd_opt(2024, 4, 3)
                     .unwrap()
                     .and_hms_opt(0, 0, 0)
                     .unwrap(),
@@ -566,25 +566,25 @@ mod tests {
             )
         );
 
-        // Day > 12 should parse correctly as dd/mm/yyyy
-        let parsed = parse_rpms_datetime("18/09/2024").unwrap();
-        assert_eq!(
-            parsed,
-            DateTime::<Utc>::from_naive_utc_and_offset(
-                NaiveDate::from_ymd_opt(2024, 9, 18)
-                    .unwrap()
-                    .and_hms_opt(0, 0, 0)
-                    .unwrap(),
-                Utc
-            )
-        );
-
-        // Fallback: mm/dd/yyyy when first component > 12
+        // Day > 12 should parse correctly as mm/dd/yyyy
         let parsed = parse_rpms_datetime("11/30/2022").unwrap();
         assert_eq!(
             parsed,
             DateTime::<Utc>::from_naive_utc_and_offset(
                 NaiveDate::from_ymd_opt(2022, 11, 30)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap(),
+                Utc
+            )
+        );
+
+        // Fallback: dd/mm/yyyy when first component > 12
+        let parsed = parse_rpms_datetime("18/09/2024").unwrap();
+        assert_eq!(
+            parsed,
+            DateTime::<Utc>::from_naive_utc_and_offset(
+                NaiveDate::from_ymd_opt(2024, 9, 18)
                     .unwrap()
                     .and_hms_opt(0, 0, 0)
                     .unwrap(),
