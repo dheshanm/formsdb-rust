@@ -34,9 +34,6 @@ const IGNORED_METADATA_COLUMNS: &[&str] = &[
     "visit",
 ];
 const DEFAULT_LOG_FREQ: usize = 100;
-/// Special-code `LastModifiedDate` for current pharmaceutical treatment forms
-/// that have no row with a non-matching `interview_date`.
-const PHARM_NO_CONTACT_DATE: &str = "01/01/2030";
 
 /// Import all RPMS CSVs into the database.
 /// Required environment variable: DB_URI.
@@ -163,38 +160,19 @@ fn cohort_from_criteria(surveys: &Path, subject_id: &str) -> ImportResult<Option
     }
 }
 
-fn read_non_flat_csv(path: &Path) -> ImportResult<Option<Vec<BTreeMap<String, String>>>> {
+fn latest_non_flat_mdate(path: &Path) -> ImportResult<Option<String>> {
     let non_flat_path = path.with_extension("");
     if !non_flat_path.exists() {
         warn!("non-flat form file not found: {}", non_flat_path.display());
         return Ok(None);
     }
-    Ok(Some(read_csv(&non_flat_path)?))
-}
-
-fn latest_mdate(rows: &[BTreeMap<String, String>]) -> Option<String> {
-    rows.iter()
-        .filter_map(|row| row.get("LastModifiedDate"))
-        .filter_map(|value| parse_rpms_datetime(value).map(|date| (date, value)))
+    let latest = read_csv(&non_flat_path)?
+        .into_iter()
+        .filter_map(|row| row.get("LastModifiedDate").cloned())
+        .filter_map(|value| parse_rpms_datetime(&value).map(|date| (date, value)))
         .max_by_key(|(date, _)| *date)
-        .map(|(_, value)| value.clone())
-}
-
-/// Latest `interview_date` among rows whose `interview_date` differs from the
-/// date part of `LastModifiedDate`. Rows where the two match were (re)saved on
-/// the day of entry, typically by retrospective QC corrections, so they do not
-/// reflect when the subject was last contacted about the form. Falls back to
-/// `PHARM_NO_CONTACT_DATE` when every row matches.
-fn latest_non_matching_interview_date(rows: &[BTreeMap<String, String>]) -> String {
-    rows.iter()
-        .filter_map(|row| {
-            let raw = row.get("interview_date")?;
-            let interview = parse_rpms_datetime(raw)?.date_naive();
-            let modified = parse_rpms_datetime(row.get("LastModifiedDate")?)?.date_naive();
-            (interview != modified).then_some((interview, raw))
-        })
-        .max_by_key(|(date, _)| *date)
-        .map_or_else(|| PHARM_NO_CONTACT_DATE.to_owned(), |(_, raw)| raw.clone())
+        .map(|(_, value)| value);
+    Ok(latest)
 }
 
 fn process_subject(subject_path: PathBuf) -> ImportResult<SubjectImport> {
@@ -212,14 +190,7 @@ fn process_subject(subject_path: PathBuf) -> ImportResult<SubjectImport> {
 
         let mut rows = read_csv(&path)?;
         if path.extension().is_some_and(|extension| extension == "flat") {
-            let last_modified = read_non_flat_csv(&path)?.and_then(|non_flat_rows| {
-                if form_name.starts_with("current_pharmaceutical_treatment") {
-                    Some(latest_non_matching_interview_date(&non_flat_rows))
-                } else {
-                    latest_mdate(&non_flat_rows)
-                }
-            });
-            if let Some(last_modified) = last_modified {
+            if let Some(last_modified) = latest_non_flat_mdate(&path)? {
                 for row in &mut rows {
                     row.insert("LastModifiedDate".to_owned(), last_modified.clone());
                 }
@@ -619,37 +590,6 @@ mod tests {
                     .unwrap(),
                 Utc
             )
-        );
-    }
-
-    fn pharm_row(last_modified: &str, interview_date: &str) -> BTreeMap<String, String> {
-        BTreeMap::from([
-            ("LastModifiedDate".to_owned(), last_modified.to_owned()),
-            ("interview_date".to_owned(), interview_date.to_owned()),
-        ])
-    }
-
-    #[test]
-    fn pharm_uses_latest_non_matching_interview_date() {
-        // BM89694: the last row was added by QC on its interview_date and is ignored
-        let rows = [
-            pharm_row("9/01/2024 8:22:19 AM", "04/14/2023"),
-            pharm_row("9/01/2024 8:22:39 AM", "04/14/2023"),
-            pharm_row("13/11/2025 4:44:57 AM", "08/04/2023"),
-            pharm_row("13/11/2025 4:45:16 AM", "08/04/2023"),
-            pharm_row("23/03/2026 10:49:06 AM", "03/23/2026"),
-        ];
-        assert_eq!(latest_non_matching_interview_date(&rows), "08/04/2023");
-    }
-
-    #[test]
-    fn pharm_without_non_matching_rows_uses_special_code() {
-        // BM44608: single row, LastModifiedDate matches interview_date
-        let rows = [pharm_row("23/03/2026 10:33:26 AM", "03/23/2026")];
-        assert_eq!(latest_non_matching_interview_date(&rows), PHARM_NO_CONTACT_DATE);
-        assert_eq!(
-            parse_rpms_datetime(PHARM_NO_CONTACT_DATE).unwrap().date_naive(),
-            NaiveDate::from_ymd_opt(2030, 1, 1).unwrap()
         );
     }
 
