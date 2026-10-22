@@ -12,6 +12,10 @@ name = "ingest_eeg_qc"
 path = "src/ingest_eeg_qc.rs"
 
 [[bin]]
+name = "ingest_lab_reports"
+path = "src/ingest_lab_reports.rs"
+
+[[bin]]
 name = "mindlamp_qc"
 path = "src/mindlamp_qc.rs"
 
