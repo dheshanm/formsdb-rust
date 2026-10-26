@@ -35,7 +35,8 @@ type AuditResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 /// Infer the date format of every date and datetime column in the RPMS survey CSVs.
 ///
-/// Scans `<DATA_ROOT>/PHOENIX/PROTECTED/*/raw/*/surveys/*.csv` and writes one row per
+/// Scans `<DATA_ROOT>/PHOENIX/PROTECTED/*/raw/*/surveys/*.csv` (and the `*.csv.flat` files
+/// that import_rpms_csvs reads for some forms) and writes one row per
 /// (form file, variable, date format). A variable whose values use more than one
 /// format gets one row per format.
 #[derive(Parser, Debug)]
@@ -166,6 +167,13 @@ fn classify_value(value: &str) -> Option<(&'static str, Vec<&'static str>, Value
     None
 }
 
+/// Survey CSVs, including the `.csv.flat` files that import_rpms_csvs reads for some forms.
+fn is_survey_csv(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".csv") || name.ends_with(".csv.flat"))
+}
+
 fn form_file_name(subject_id: &str, file_name: &str) -> String {
     file_name
         .strip_prefix(subject_id)
@@ -213,7 +221,7 @@ fn scan_subject(surveys: PathBuf) -> AuditResult<Audit> {
 
     let mut files = fs::read_dir(&surveys)?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.is_file() && path.extension().is_some_and(|extension| extension == "csv"))
+        .filter(|path| path.is_file() && is_survey_csv(path))
         .collect::<Vec<_>>();
     files.sort();
 
@@ -427,6 +435,18 @@ mod tests {
             form_file_name("BM83373", "BM83373.Prescient.Run_sheet_PennCNB_1.csv"),
             "Prescient.Run_sheet_PennCNB_1.csv"
         );
+        assert_eq!(
+            form_file_name("BM00644", "BM00644_adverse_events.csv.flat"),
+            "adverse_events.csv.flat"
+        );
+    }
+
+    #[test]
+    fn selects_csv_and_flat_survey_files() {
+        assert!(is_survey_csv(Path::new("surveys/BM00644_psychs_p1p8.csv")));
+        assert!(is_survey_csv(Path::new("surveys/BM00644_adverse_events.csv.flat")));
+        assert!(!is_survey_csv(Path::new("surveys/BM00644_notes.txt")));
+        assert!(!is_survey_csv(Path::new("surveys/BM00644_adverse_events.flat")));
     }
 
     #[test]
