@@ -33,6 +33,15 @@ const IGNORED_METADATA_COLUMNS: &[&str] = &[
     "gender",
     "visit",
 ];
+/// Date-only RPMS columns written as mm/dd/yyyy, besides the interview dates (see audit_date).
+/// All other date-only columns, and every datetime, are dd/mm/yyyy.
+const MONTH_FIRST_DATE_COLUMNS: &[&str] = &[
+    "chrcrit_date",
+    "chrax_config_date",
+    "chraxci_config_date",
+    "chrdig_change_date",
+    "chrcbccs_review_date",
+];
 const DEFAULT_LOG_FREQ: usize = 100;
 
 /// Import all RPMS CSVs into the database.
@@ -89,10 +98,20 @@ fn read_csv(path: &Path) -> ImportResult<Vec<BTreeMap<String, String>>> {
     Ok(records)
 }
 
-fn parse_rpms_datetime(value: &str) -> Option<DateTime<Utc>> {
+fn is_month_first_date_column(column: &str) -> bool {
+    // `contains` rather than `ends_with`: e.g. chrsofas_interview_date_fu
+    column.contains("interview_date") || MONTH_FIRST_DATE_COLUMNS.contains(&column)
+}
+
+fn parse_rpms_datetime(column: &str, value: &str) -> Option<DateTime<Utc>> {
     let naive = if value.len() == 10 {
-        NaiveDate::parse_from_str(value, "%m/%d/%Y")
-            .or_else(|_| NaiveDate::parse_from_str(value, "%d/%m/%Y"))
+        let (primary, fallback) = if is_month_first_date_column(column) {
+            ("%m/%d/%Y", "%d/%m/%Y")
+        } else {
+            ("%d/%m/%Y", "%m/%d/%Y")
+        };
+        NaiveDate::parse_from_str(value, primary)
+            .or_else(|_| NaiveDate::parse_from_str(value, fallback))
             .ok()?
             .and_hms_opt(0, 0, 0)?
     } else if value.len() > 10 {
@@ -105,7 +124,7 @@ fn parse_rpms_datetime(value: &str) -> Option<DateTime<Utc>> {
     Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
 }
 
-fn value_to_json(value: &str) -> Value {
+fn value_to_json(column: &str, value: &str) -> Value {
     let value = value.trim();
     if let Ok(number) = value.parse::<i64>() {
         return Value::Number(number.into());
@@ -115,7 +134,7 @@ fn value_to_json(value: &str) -> Value {
             return Value::Number(number);
         }
     }
-    if let Some(datetime) = parse_rpms_datetime(value) {
+    if let Some(datetime) = parse_rpms_datetime(column, value) {
         return Value::String(datetime.to_rfc3339());
     }
     Value::String(value.to_owned())
@@ -169,7 +188,7 @@ fn latest_non_flat_mdate(path: &Path) -> ImportResult<Option<String>> {
     let latest = read_csv(&non_flat_path)?
         .into_iter()
         .filter_map(|row| row.get("LastModifiedDate").cloned())
-        .filter_map(|value| parse_rpms_datetime(&value).map(|date| (date, value)))
+        .filter_map(|value| parse_rpms_datetime("LastModifiedDate", &value).map(|date| (date, value)))
         .max_by_key(|(date, _)| *date)
         .map(|(_, value)| value);
     Ok(latest)
@@ -199,7 +218,7 @@ fn process_subject(subject_path: PathBuf) -> ImportResult<SubjectImport> {
 
         if form_name == "informed_consent_run_sheet" {
             rows.sort_by_key(|row| row.get("chric_consent_date")
-                .and_then(|value| parse_rpms_datetime(value)));
+                .and_then(|value| parse_rpms_datetime("chric_consent_date", value)));
             rows.truncate(1);
             if cohort.is_none() {
                 let group = rows.first().and_then(|row| row.get("group"))
@@ -246,7 +265,10 @@ fn process_subject(subject_path: PathBuf) -> ImportResult<SubjectImport> {
             let (with_data, without_data, total, percent) = metadata(&row);
             let form_data = row.into_iter()
                 .filter(|(_, value)| !value.is_empty())
-                .map(|(column, value)| (column, value_to_json(&value)))
+                .map(|(column, value)| {
+                    let json = value_to_json(&column, &value);
+                    (column, json)
+                })
                 .collect::<Map<_, _>>();
             forms.push(FormInsert {
                 form_name,
@@ -553,8 +575,8 @@ mod tests {
 
     #[test]
     fn parses_month_first_rpms_dates() {
-        // RPMS date-only fields are mm/dd/yyyy: ambiguous 04/03/2024 is 3rd of April, not 4th of March
-        let parsed = parse_rpms_datetime("04/03/2024").unwrap();
+        // RPMS interview dates are mm/dd/yyyy: ambiguous 04/03/2024 is 3rd of April, not 4th of March
+        let parsed = parse_rpms_datetime("chrpsychs_fu_interview_date", "04/03/2024").unwrap();
         assert_eq!(
             parsed,
             DateTime::<Utc>::from_naive_utc_and_offset(
@@ -567,7 +589,7 @@ mod tests {
         );
 
         // Day > 12 should parse correctly as mm/dd/yyyy
-        let parsed = parse_rpms_datetime("11/30/2022").unwrap();
+        let parsed = parse_rpms_datetime("chrpsychs_fu_interview_date", "11/30/2022").unwrap();
         assert_eq!(
             parsed,
             DateTime::<Utc>::from_naive_utc_and_offset(
@@ -580,7 +602,7 @@ mod tests {
         );
 
         // Fallback: dd/mm/yyyy when first component > 12
-        let parsed = parse_rpms_datetime("18/09/2024").unwrap();
+        let parsed = parse_rpms_datetime("chrpsychs_fu_interview_date", "18/09/2024").unwrap();
         assert_eq!(
             parsed,
             DateTime::<Utc>::from_naive_utc_and_offset(
@@ -595,7 +617,7 @@ mod tests {
 
     #[test]
     fn parses_rpms_datetimes_with_time() {
-        let parsed = parse_rpms_datetime("18/09/2024 3:51:49 AM").unwrap();
+        let parsed = parse_rpms_datetime("chr_aedate", "18/09/2024 3:51:49 AM").unwrap();
         assert_eq!(
             parsed,
             DateTime::<Utc>::from_naive_utc_and_offset(
@@ -607,7 +629,7 @@ mod tests {
             )
         );
 
-        let parsed = parse_rpms_datetime("04/03/2024 1:53:00 PM").unwrap();
+        let parsed = parse_rpms_datetime("chr_aedate", "04/03/2024 1:53:00 PM").unwrap();
         assert_eq!(
             parsed,
             DateTime::<Utc>::from_naive_utc_and_offset(
@@ -618,5 +640,35 @@ mod tests {
                 Utc
             )
         );
+    }
+
+    fn date(year: i32, month: u32, day: u32) -> DateTime<Utc> {
+        DateTime::<Utc>::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(year, month, day).unwrap().and_hms_opt(0, 0, 0).unwrap(),
+            Utc,
+        )
+    }
+
+    #[test]
+    fn parses_day_first_rpms_dates() {
+        // Other date-only fields (psychs, SCID) are dd/mm/yyyy: 04/03/2024 is 4th of March
+        assert_eq!(parse_rpms_datetime("chrpsychs_fu_1c1_on3", "04/03/2024"), Some(date(2024, 3, 4)));
+        assert_eq!(parse_rpms_datetime("chrpsychs_fu_1c1_on3", "18/09/2024"), Some(date(2024, 9, 18)));
+        assert_eq!(parse_rpms_datetime("chrscid_b47", "05/06/2023"), Some(date(2023, 6, 5)));
+        // Fallback: mm/dd/yyyy when the second component > 12
+        assert_eq!(parse_rpms_datetime("chrpsychs_scr_1d23_date", "10/31/2023"), Some(date(2023, 10, 31)));
+    }
+
+    #[test]
+    fn parses_month_first_columns() {
+        for column in ["interview_date", "chrsofas_interview_date_fu", "chrcrit_date", "chraxci_config_date"] {
+            assert_eq!(parse_rpms_datetime(column, "04/03/2024"), Some(date(2024, 4, 3)), "{column}");
+        }
+    }
+
+    #[test]
+    fn converts_dates_by_column() {
+        assert_eq!(value_to_json("chrpsychs_scr_1a14_on", "04/03/2024"), Value::String(date(2024, 3, 4).to_rfc3339()));
+        assert_eq!(value_to_json("chrpsychs_scr_interview_date", "04/03/2024"), Value::String(date(2024, 4, 3).to_rfc3339()));
     }
 }
