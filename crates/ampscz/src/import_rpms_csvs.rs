@@ -43,6 +43,9 @@ const MONTH_FIRST_DATE_COLUMNS: &[&str] = &[
     "chrcbccs_review_date",
 ];
 const DEFAULT_LOG_FREQ: usize = 100;
+/// `LastModifiedDate` for current pharmaceutical treatment forms with no usable
+/// contact date (see `pharm_last_contact_date`).
+const PHARM_NO_CONTACT_DATE: &str = "01/01/2030";
 
 /// Import all RPMS CSVs into the database.
 /// Required environment variable: DB_URI.
@@ -179,19 +182,57 @@ fn cohort_from_criteria(surveys: &Path, subject_id: &str) -> ImportResult<Option
     }
 }
 
-fn latest_non_flat_mdate(path: &Path) -> ImportResult<Option<String>> {
+fn read_non_flat_csv(path: &Path) -> ImportResult<Option<Vec<BTreeMap<String, String>>>> {
     let non_flat_path = path.with_extension("");
     if !non_flat_path.exists() {
         warn!("non-flat form file not found: {}", non_flat_path.display());
         return Ok(None);
     }
-    let latest = read_csv(&non_flat_path)?
-        .into_iter()
-        .filter_map(|row| row.get("LastModifiedDate").cloned())
-        .filter_map(|value| parse_rpms_datetime("LastModifiedDate", &value).map(|date| (date, value)))
+    Ok(Some(read_csv(&non_flat_path)?))
+}
+
+fn latest_mdate<'a>(rows: impl IntoIterator<Item = &'a BTreeMap<String, String>>) -> Option<String> {
+    rows.into_iter()
+        .filter_map(|row| row.get("LastModifiedDate"))
+        .filter_map(|value| parse_rpms_datetime("LastModifiedDate", value).map(|date| (date, value)))
         .max_by_key(|(date, _)| *date)
-        .map(|(_, value)| value);
-    Ok(latest)
+        .map(|(_, value)| value.clone())
+}
+
+fn is_qc_entry(row: &BTreeMap<String, String>) -> bool {
+    // Prefixes catch the misspellings in the data: "restrospectively", "retrospsectively", ...
+    row.get("chrpharm_med_comments").is_some_and(|comment| {
+        comment.split(|c: char| !c.is_alphanumeric()).any(|word| {
+            let word = word.to_lowercase();
+            word == "qc" || word.starts_with("retrosp") || word.starts_with("restrosp")
+        })
+    })
+}
+
+/// `LastModifiedDate` for current pharmaceutical treatment forms: the date the
+/// subject was last contacted. Entries added or corrected later as part of QC
+/// would overwrite that, so they are skipped. If every entry is a QC entry, use
+/// the latest interview date that differs from its entry's `LastModifiedDate`,
+/// or `PHARM_NO_CONTACT_DATE` if there is none.
+fn pharm_last_contact_date(rows: &[BTreeMap<String, String>]) -> Option<String> {
+    if rows.is_empty() {
+        return None;
+    }
+    if let Some(mdate) = latest_mdate(rows.iter().filter(|row| !is_qc_entry(row))) {
+        return Some(mdate);
+    }
+    let interview_date = rows.iter()
+        .filter_map(|row| {
+            let interview = parse_rpms_datetime("interview_date", row.get("interview_date")?)?.date_naive();
+            let modified = row.get("LastModifiedDate")
+                .and_then(|value| parse_rpms_datetime("LastModifiedDate", value))
+                .map(|date| date.date_naive());
+            (modified != Some(interview)).then_some(interview)
+        })
+        .max()
+        // interview_date is mm/dd/yyyy, but LastModifiedDate is parsed as dd/mm/yyyy
+        .map(|date| date.format("%d/%m/%Y").to_string());
+    Some(interview_date.unwrap_or_else(|| PHARM_NO_CONTACT_DATE.to_owned()))
 }
 
 fn process_subject(subject_path: PathBuf) -> ImportResult<SubjectImport> {
@@ -209,7 +250,18 @@ fn process_subject(subject_path: PathBuf) -> ImportResult<SubjectImport> {
 
         let mut rows = read_csv(&path)?;
         if path.extension().is_some_and(|extension| extension == "flat") {
-            if let Some(last_modified) = latest_non_flat_mdate(&path)? {
+            let last_modified = read_non_flat_csv(&path)?.and_then(|non_flat_rows| {
+                if form_name.starts_with("current_pharmaceutical_treatment") {
+                    let last_contact = pharm_last_contact_date(&non_flat_rows);
+                    if last_contact.as_deref() == Some(PHARM_NO_CONTACT_DATE) {
+                        warn!("no usable contact date, using {PHARM_NO_CONTACT_DATE}: {}", path.display());
+                    }
+                    last_contact
+                } else {
+                    latest_mdate(&non_flat_rows)
+                }
+            });
+            if let Some(last_modified) = last_modified {
                 for row in &mut rows {
                     row.insert("LastModifiedDate".to_owned(), last_modified.clone());
                 }
@@ -670,5 +722,57 @@ mod tests {
     fn converts_dates_by_column() {
         assert_eq!(value_to_json("chrpsychs_scr_1a14_on", "04/03/2024"), Value::String(date(2024, 3, 4).to_rfc3339()));
         assert_eq!(value_to_json("chrpsychs_scr_interview_date", "04/03/2024"), Value::String(date(2024, 4, 3).to_rfc3339()));
+    }
+
+    fn pharm_entry(last_modified: &str, interview_date: &str, comment: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("LastModifiedDate".to_owned(), last_modified.to_owned()),
+            ("interview_date".to_owned(), interview_date.to_owned()),
+            ("chrpharm_med_comments".to_owned(), comment.to_owned()),
+        ])
+    }
+
+    // Spelling and layout follow the real QC entries; the site and initials are placeholders
+    const QC_COMMENT: &str = "Entry added restrospectively as part of QC processes - XX site, AB, 23/03/2009\n";
+
+    fn pharm_mdate(rows: &[BTreeMap<String, String>]) -> Option<DateTime<Utc>> {
+        pharm_last_contact_date(rows).and_then(|value| parse_rpms_datetime("LastModifiedDate", &value))
+    }
+
+    #[test]
+    fn pharm_skips_qc_entries() {
+        // The latest entry is a QC entry, so the latest non-QC entry is used
+        let rows = [
+            pharm_entry("9/01/2007 8:22:19 AM", "04/14/2006", "Comment one."),
+            pharm_entry("9/01/2007 8:22:39 AM", "04/14/2006", "Comment two."),
+            pharm_entry("13/11/2008 4:44:57 AM", "08/04/2006", "Comment three."),
+            pharm_entry("13/11/2008 4:45:16 AM", "08/04/2006", "Comment four. "),
+            pharm_entry("23/03/2009 10:49:06 AM", "03/23/2009", QC_COMMENT),
+        ];
+        assert_eq!(pharm_last_contact_date(&rows).as_deref(), Some("13/11/2008 4:45:16 AM"));
+    }
+
+    #[test]
+    fn pharm_single_qc_entry_on_interview_date_uses_special_code() {
+        let rows = [pharm_entry("23/03/2009 10:55:05 AM", "03/23/2009", QC_COMMENT)];
+        assert_eq!(pharm_last_contact_date(&rows).as_deref(), Some(PHARM_NO_CONTACT_DATE));
+        assert_eq!(pharm_mdate(&rows), Some(date(2030, 1, 1)));
+    }
+
+    #[test]
+    fn pharm_single_qc_entry_uses_earlier_interview_date() {
+        // 08/04/2006 is mm/dd/yyyy: 4th of August, not 8th of April
+        let rows = [pharm_entry("23/03/2009 10:55:05 AM", "08/04/2006", QC_COMMENT)];
+        assert_eq!(pharm_mdate(&rows), Some(date(2006, 8, 4)));
+    }
+
+    #[test]
+    fn detects_qc_comments() {
+        for comment in [QC_COMMENT, "Added retrospectively", "added retrospsectively", "qc correction", "Updated (QC)"] {
+            assert!(is_qc_entry(&pharm_entry("", "", comment)), "{comment}");
+        }
+        for comment in ["", "Comment one.", "Acquired from records"] {
+            assert!(!is_qc_entry(&pharm_entry("", "", comment)), "{comment}");
+        }
     }
 }
