@@ -33,7 +33,8 @@ const UNKNOWN_SENSOR: &str = "unknown";
 /// Files whose size and modification time match the stored QC row are skipped
 /// without reading their contents (only a `stat` is issued), which keeps
 /// re-runs cheap on network / object-storage mounts.
-/// Required environment variable: DB_URI.
+/// Required environment variable: DB_URI (unless `--out` is given, in which
+/// case results are written to a CSV file and the database is not touched).
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Cli {
@@ -60,6 +61,12 @@ struct Cli {
     /// glob, init) still exit non-zero.
     #[arg(long)]
     allow_file_errors: bool,
+
+    /// Write QC rows to this CSV file instead of the database. DB_URI is not
+    /// needed, and every file is read (there is no stored row to compare
+    /// against). An existing file is overwritten.
+    #[arg(short, long, value_name = "CSV")]
+    out: Option<PathBuf>,
 }
 
 const INIT_QUERIES: &[&str] = &[
@@ -626,8 +633,64 @@ ON CONFLICT (subject_id, mindlamp_id, data_type, data_date) DO UPDATE SET
     Ok(())
 }
 
+/// One CSV row; mirrors `mindlamp.file_qc`, with the scalar metrics also
+/// pulled out into their own columns for convenience.
+#[derive(Debug, Serialize)]
+struct CsvRow<'a> {
+    mindlamp_id: &'a str,
+    subject_id: &'a str,
+    data_type: &'static str,
+    data_date: NaiveDate,
+    num_events: Option<u64>,
+    file_size_bytes: Option<u64>,
+    file_modified_at: Option<&'a str>,
+    /// Full `qc_metrics` object, as JSON.
+    qc_metrics: String,
+    source_file_path: &'a str,
+}
+
+impl<'a> CsvRow<'a> {
+    fn new(qc: &'a FileQc) -> ImportResult<Self> {
+        Ok(CsvRow {
+            mindlamp_id: &qc.key.mindlamp_id,
+            subject_id: &qc.key.subject_id,
+            data_type: qc.key.data_type.as_str(),
+            data_date: qc.key.data_date,
+            num_events: qc.qc_metrics["num_events"].as_u64(),
+            file_size_bytes: qc.qc_metrics["file_size_bytes"].as_u64(),
+            file_modified_at: qc.qc_metrics["file_modified_at"].as_str(),
+            qc_metrics: serde_json::to_string(&qc.qc_metrics)?,
+            source_file_path: &qc.source_file_path,
+        })
+    }
+}
+
+/// Write QC rows to `out`, ordered by the table's primary key so output is
+/// deterministic regardless of processing order.
+fn write_csv(out: &Path, rows: &mut [FileQc]) -> ImportResult<()> {
+    rows.sort_by(|a, b| {
+        let key = |q: &FileQc| {
+            (
+                q.key.subject_id.clone(),
+                q.key.mindlamp_id.clone(),
+                q.key.data_type.as_str(),
+                q.key.data_date,
+            )
+        };
+        key(a).cmp(&key(b))
+    });
+
+    let mut writer = csv::Writer::from_path(out)
+        .map_err(|e| format!("failed to create {}: {e}", out.display()))?;
+    for qc in rows.iter() {
+        writer.serialize(CsvRow::new(qc)?)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
 async fn process_file(
-    pool: &PgPool,
+    pool: Option<&PgPool>,
     path: PathBuf,
     key: FileKey,
     stored: Arc<HashMap<FileKey, StoredRow>>,
@@ -639,7 +702,7 @@ async fn process_file(
     })
     .await??;
 
-    if let Outcome::Ingested(qc) = &outcome {
+    if let (Some(pool), Outcome::Ingested(qc)) = (pool, &outcome) {
         upsert_qc(pool, qc).await?;
     }
     Ok(outcome)
@@ -683,23 +746,35 @@ async fn main() -> ImportResult<()> {
     subject_ids.sort();
     subject_ids.dedup();
 
-    let db_uri = std::env::var("DB_URI").map_err(|_| "DB_URI environment variable must be set")?;
-    let pool = db::create_pool_with_options(&db_uri, cli.max_connections.max(1)).await?;
-
-    init_db(&pool).await?;
-
-    let stored = if cli.force {
-        HashMap::new()
-    } else {
-        load_stored_rows(&pool, &subject_ids).await?
+    // With `--out`, results go to a CSV file and the database is never opened.
+    let pool = match &cli.out {
+        Some(out) => {
+            info!(out = %out.display(), "Writing file QC to CSV; database will not be used");
+            None
+        }
+        None => {
+            let db_uri = std::env::var("DB_URI")
+                .map_err(|_| "DB_URI environment variable must be set (or pass --out)")?;
+            let pool = db::create_pool_with_options(&db_uri, cli.max_connections.max(1)).await?;
+            init_db(&pool).await?;
+            Some(pool)
+        }
     };
-    info!(
-        subjects = subject_ids.len(),
-        stored_rows = stored.len(),
-        force = cli.force,
-        "Loaded existing file QC rows"
-    );
+
+    let stored = match &pool {
+        Some(pool) if !cli.force => {
+            let stored = load_stored_rows(pool, &subject_ids).await?;
+            info!(
+                subjects = subject_ids.len(),
+                stored_rows = stored.len(),
+                "Loaded existing file QC rows"
+            );
+            stored
+        }
+        _ => HashMap::new(),
+    };
     let stored = Arc::new(stored);
+    let collect_rows = cli.out.is_some();
 
     let progress_style = ProgressStyle::default_bar()
         .template("{span_child_prefix}{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) {msg}")
@@ -711,14 +786,14 @@ async fn main() -> ImportResult<()> {
     qc_span.pb_set_length(files.len() as u64);
     qc_span.pb_set_message("Computing Mindlamp file QC");
 
-    let summary = stream::iter(files)
+    let (summary, mut csv_rows) = stream::iter(files)
         .map(|(path, key)| {
             let pool = pool.clone();
             let stored = Arc::clone(&stored);
             let qc_span = qc_span.clone();
             async move {
                 let display_path = path.display().to_string();
-                let result = process_file(&pool, path, key, stored, cli.force).await;
+                let result = process_file(pool.as_ref(), path, key, stored, cli.force).await;
                 match &result {
                     Ok(Outcome::Skipped) => debug!(file = %display_path, "Unchanged; skipped"),
                     Ok(Outcome::Ingested(qc)) => info!(
@@ -734,16 +809,29 @@ async fn main() -> ImportResult<()> {
             }
         })
         .buffer_unordered(cli.jobs.max(1))
-        .fold(summary, |mut summary, result| async move {
-            match result {
-                Ok(Outcome::Skipped) => summary.skipped += 1,
-                Ok(Outcome::Ingested(_)) => summary.ingested += 1,
-                Err(_) => summary.failed += 1,
-            }
-            summary
-        })
+        .fold(
+            (summary, Vec::new()),
+            |(mut summary, mut rows), result| async move {
+                match result {
+                    Ok(Outcome::Skipped) => summary.skipped += 1,
+                    Ok(Outcome::Ingested(qc)) => {
+                        summary.ingested += 1;
+                        if collect_rows {
+                            rows.push(qc);
+                        }
+                    }
+                    Err(_) => summary.failed += 1,
+                }
+                (summary, rows)
+            },
+        )
         .await;
     drop(qc_span);
+
+    if let Some(out) = &cli.out {
+        write_csv(out, &mut csv_rows)?;
+        info!(out = %out.display(), rows = csv_rows.len(), "Wrote file QC CSV");
+    }
 
     info!(
         ingested = summary.ingested,
@@ -752,7 +840,9 @@ async fn main() -> ImportResult<()> {
         "Mindlamp file QC complete"
     );
 
-    pool.close().await;
+    if let Some(pool) = pool {
+        pool.close().await;
+    }
 
     if summary.failed > 0 {
         let msg = format!(
@@ -1023,6 +1113,76 @@ mod tests {
                 "file_modified_at": "2026-03-12T05:00:00Z",
             })
         );
+    }
+
+    #[test]
+    fn test_write_csv() {
+        let dir = std::env::temp_dir().join(format!("mindlamp_qc_csv_test_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("qc.csv");
+
+        let qc = |subject: &str, data_type: DataType, metrics: Value| FileQc {
+            key: FileKey {
+                mindlamp_id: "U1".to_owned(),
+                subject_id: subject.to_owned(),
+                data_type,
+                data_date: NaiveDate::from_ymd_opt(2026, 2, 24).unwrap(),
+            },
+            qc_metrics: metrics,
+            source_file_path: format!("/data/{subject}.json"),
+        };
+        let st = state(10, "2026-03-12T05:00:00Z");
+        let mut rows = vec![
+            qc(
+                "YA2",
+                DataType::Activity,
+                build_qc_metrics(DataType::Activity, b"[{}]", &st).unwrap(),
+            ),
+            qc(
+                "YA1",
+                DataType::Sensor,
+                build_qc_metrics(
+                    DataType::Sensor,
+                    br#"[{"sensor": "lamp.gps", "data": {}}]"#,
+                    &st,
+                )
+                .unwrap(),
+            ),
+        ];
+        write_csv(&out, &mut rows).unwrap();
+
+        let mut reader = csv::Reader::from_path(&out).unwrap();
+        let headers = reader.headers().unwrap().clone();
+        assert_eq!(
+            headers.iter().collect::<Vec<_>>(),
+            [
+                "mindlamp_id",
+                "subject_id",
+                "data_type",
+                "data_date",
+                "num_events",
+                "file_size_bytes",
+                "file_modified_at",
+                "qc_metrics",
+                "source_file_path",
+            ]
+        );
+        let records: Vec<csv::StringRecord> = reader.records().map(Result::unwrap).collect();
+        fs::remove_dir_all(&dir).unwrap();
+
+        // Sorted by subject_id
+        assert_eq!(records.len(), 2);
+        assert_eq!(&records[0][1], "YA1");
+        assert_eq!(&records[0][2], "sensor");
+        assert_eq!(&records[0][3], "2026-02-24");
+        assert_eq!(&records[0][4], "1");
+        assert_eq!(&records[0][5], "10");
+        assert_eq!(&records[0][6], "2026-03-12T05:00:00Z");
+        let metrics: Value = serde_json::from_str(&records[0][7]).unwrap();
+        assert_eq!(metrics["sensor_counts"], json!({"gps": 1}));
+        assert_eq!(&records[0][8], "/data/YA1.json");
+        assert_eq!(&records[1][1], "YA2");
+        assert_eq!(&records[1][2], "activity");
     }
 
     #[test]
