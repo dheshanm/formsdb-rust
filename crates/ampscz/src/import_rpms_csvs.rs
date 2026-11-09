@@ -37,10 +37,15 @@ const IGNORED_METADATA_COLUMNS: &[&str] = &[
 /// All other date-only columns, and every datetime, are dd/mm/yyyy.
 const MONTH_FIRST_DATE_COLUMNS: &[&str] = &[
     "chrcrit_date",
-    "chrax_config_date",
-    "chraxci_config_date",
-    "chrdig_change_date",
     "chrcbccs_review_date",
+
+    // Following columns were previously considered month-first
+    // but were fixed to follow the correct date format, after
+    // reaching out to the data source for clarification.
+
+    // "chrax_config_date",
+    // "chraxci_config_date",
+    // "chrdig_change_date",
 ];
 const DEFAULT_LOG_FREQ: usize = 100;
 /// `LastModifiedDate` for current pharmaceutical treatment forms with no usable
